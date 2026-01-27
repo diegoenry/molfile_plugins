@@ -2,9 +2,11 @@
 
 University of Illinois Open Source License
 
+The authors of hte VMD_H5MD plugin released it under GPL, so we need a brand new one if we want to distribute it with VMD.
+
 Reads H5MD trajectory files produced by GROMACS 2026.0+ with the
 gromacs_topology module extension.
-
+ 
 Author: Diego E. B. Gomes - Auburn University, Alabama, AL - USA 
 E-mail: dgomes@auburn.edu 
 Version: 0.1
@@ -14,7 +16,6 @@ This is a temporary location, plugin will be moved to VMD 2.0 plugin source tree
 
 # WARNING 2:
 The modules gromacs.mdwn and gromacs_topology.mdwn are not official GROMACS files, and certainly incomplete specifications. They're my interpretation of the GROMCAS 2026.0 source code and the h5md I had on my hands. 
-
 
 # Plugin build instructions tested for MacOSX Sequoia 15.7.3
 
