@@ -1,0 +1,174 @@
+# Makefile for GROMACS H5MD VMD Plugin
+#
+# This Makefile builds the h5mdplugin_gromacs.so shared library
+# for use with VMD (Visual Molecular Dynamics).
+#
+# Usage:
+#   make -f Makefile.h5md_gromacs           # Build plugin
+#   make -f Makefile.h5md_gromacs install   # Install to VMD
+#   make -f Makefile.h5md_gromacs clean     # Clean build artifacts
+#   make -f Makefile.h5md_gromacs config    # Show configuration
+#
+# Environment Variables:
+#   VMD_DIR       - VMD installation directory
+#   HDF5_PREFIX   - HDF5 installation prefix
+#   CC            - C compiler (default: gcc or clang)
+
+.PHONY: all clean install config
+
+# Plugin name
+PLUGIN_NAME = h5mdplugin_gromacs
+
+# Detect platform
+UNAME_S := $(shell uname -s)
+UNAME_M := $(shell uname -m)
+
+# Platform-specific settings
+ifeq ($(UNAME_S),Darwin)
+    PLATFORM = macOS
+    ifeq ($(UNAME_M),arm64)
+        ARCH = MACOSXARM64
+    else
+        ARCH = MACOSXX86_64
+    endif
+    PLUGIN_EXT = .so
+    PLUGIN_LDFLAGS = -bundle -Wl,-undefined,dynamic_lookup
+    CC ?= clang
+else ifeq ($(UNAME_S),Linux)
+    PLATFORM = Linux
+    ifeq ($(UNAME_M),x86_64)
+        ARCH = LINUXAMD64
+    else ifeq ($(UNAME_M),aarch64)
+        ARCH = LINUXARM64
+    else
+        ARCH = LINUX
+    endif
+    PLUGIN_EXT = .so
+    PLUGIN_LDFLAGS = -shared
+    CC ?= gcc
+else
+    $(error Unsupported platform: $(UNAME_S))
+endif
+
+# VMD directories
+VMD_DIR ?= /Applications/VMD.app/Contents/vmd
+VMD_PLUGIN_INCLUDE ?= $(VMD_DIR)/plugins/include
+
+# Try to find VMD automatically
+ifeq ($(PLATFORM),macOS)
+    ifeq ($(wildcard $(VMD_DIR)),)
+        VMD_DIR = /Applications/VMD\ 1.9.4a57.app/Contents/vmd
+    endif
+    ifeq ($(wildcard $(VMD_DIR)),)
+        $(warning VMD not found at default location. Set VMD_DIR manually.)
+    endif
+else
+    VMD_DIR ?= /usr/local/lib/vmd
+endif
+
+# HDF5 configuration
+HDF5_PREFIX ?= /opt/homebrew
+
+# Try pkg-config first
+HDF5_CFLAGS := $(shell pkg-config --cflags hdf5 2>/dev/null)
+HDF5_LIBS := $(shell pkg-config --libs hdf5 2>/dev/null)
+
+# If pkg-config failed, use manual paths
+ifeq ($(HDF5_CFLAGS),)
+    HDF5_INCLUDE ?= $(HDF5_PREFIX)/include
+    HDF5_LIB ?= $(HDF5_PREFIX)/lib
+    HDF5_CFLAGS = -I$(HDF5_INCLUDE)
+    HDF5_LIBS = -L$(HDF5_LIB) -lhdf5 -lz
+endif
+
+# Compiler flags
+CFLAGS = -O2 -fPIC -Wall -Wextra
+CFLAGS += -I$(VMD_PLUGIN_INCLUDE)
+CFLAGS += $(HDF5_CFLAGS)
+
+# Linker flags
+LDFLAGS = $(PLUGIN_LDFLAGS)
+LDFLAGS += $(HDF5_LIBS)
+
+# Source and output
+SRC = h5mdplugin_gromacs.c
+OBJ = h5mdplugin_gromacs.o
+TARGET = $(PLUGIN_NAME)$(PLUGIN_EXT)
+
+# Installation directory
+INSTALL_DIR ?= $(VMD_DIR)/plugins/$(ARCH)/molfile
+
+# Default target
+all: $(TARGET)
+
+# Build plugin
+$(TARGET): $(OBJ)
+	@echo "Linking $(TARGET)..."
+	$(CC) $(LDFLAGS) -o $@ $^
+	@echo "Build complete: $(TARGET)"
+
+$(OBJ): $(SRC)
+	@echo "Compiling $(SRC)..."
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+# Install to VMD
+install: $(TARGET)
+	@echo "Installing to $(INSTALL_DIR)..."
+	@mkdir -p "$(INSTALL_DIR)"
+	@cp $(TARGET) "$(INSTALL_DIR)/"
+	@echo "Installation complete"
+	@echo ""
+	@echo "To use the plugin in VMD:"
+	@echo "  mol new file.h5md type h5md_gromacs"
+	@echo ""
+	@echo "To enable atom selection:"
+	@echo "  export VMD_H5MD_SELECTION=\"protein\""
+	@echo "  vmd file.h5md"
+
+# Show configuration
+config:
+	@echo "=== GROMACS H5MD Plugin Build Configuration ==="
+	@echo ""
+	@echo "Platform:          $(PLATFORM)"
+	@echo "Architecture:      $(ARCH)"
+	@echo "Compiler:          $(CC)"
+	@echo ""
+	@echo "VMD Directory:     $(VMD_DIR)"
+	@echo "Plugin Include:    $(VMD_PLUGIN_INCLUDE)"
+	@echo "Install Directory: $(INSTALL_DIR)"
+	@echo ""
+	@echo "HDF5 Include:      $(HDF5_CFLAGS)"
+	@echo "HDF5 Libraries:    $(HDF5_LIBS)"
+	@echo ""
+	@echo "CFLAGS:            $(CFLAGS)"
+	@echo "LDFLAGS:           $(LDFLAGS)"
+	@echo ""
+	@echo "Target:            $(TARGET)"
+	@echo ""
+
+# Clean build artifacts
+clean:
+	@echo "Cleaning build artifacts..."
+	@rm -f $(OBJ) $(TARGET)
+	@echo "Clean complete"
+
+# Help target
+help:
+	@echo "GROMACS H5MD Plugin Makefile"
+	@echo ""
+	@echo "Targets:"
+	@echo "  make              - Build the plugin"
+	@echo "  make install      - Build and install to VMD"
+	@echo "  make config       - Show build configuration"
+	@echo "  make clean        - Remove build artifacts"
+	@echo "  make help         - Show this help"
+	@echo ""
+	@echo "Configuration Variables:"
+	@echo "  VMD_DIR           - VMD installation directory"
+	@echo "  HDF5_PREFIX       - HDF5 installation prefix"
+	@echo "  CC                - C compiler (gcc or clang)"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make VMD_DIR=/usr/local/lib/vmd"
+	@echo "  make HDF5_PREFIX=/usr/local"
+	@echo "  make CC=gcc"
