@@ -133,9 +133,20 @@ endif
 
 # Add HDF5 library (quote to handle spaces in paths)
 ifdef HDF5_LDFLAGS
-    LDFLAGS += $(HDF5_LDFLAGS)
+    ifneq ($(HDF5_LDFLAGS),)
+        LDFLAGS += $(HDF5_LDFLAGS)
+    else
+        LDFLAGS += -L"$(HDF5_LIB)" -lhdf5
+    endif
 else
     LDFLAGS += -L"$(HDF5_LIB)" -lhdf5
+endif
+
+# Add rpath for runtime library discovery on Linux
+ifeq ($(UNAME_S),Linux)
+    ifneq ($(HDF5_LIB),)
+        LDFLAGS += -Wl,-rpath,$(HDF5_LIB)
+    endif
 endif
 
 # Target
@@ -176,5 +187,28 @@ test: $(PLUGIN)
 	@echo "Testing plugin compilation..."
 	@echo "Plugin compiled successfully: $(PLUGIN)"
 	@file $(PLUGIN)
+	@echo ""
+	@echo "Checking library dependencies:"
+	@if command -v ldd >/dev/null 2>&1; then \
+		ldd $(PLUGIN) | grep -E "(hdf5|not found)" || echo "Warning: HDF5 not linked!"; \
+	elif command -v otool >/dev/null 2>&1; then \
+		otool -L $(PLUGIN) | grep hdf5 || echo "Warning: HDF5 not linked!"; \
+	fi
 
-.PHONY: all clean install test config
+# Verify HDF5 is properly detected
+verify-hdf5:
+	@echo "=== HDF5 Detection ==="
+	@echo "Checking pkg-config:"
+	@pkg-config --modversion hdf5 2>/dev/null || echo "  pkg-config: HDF5 not found"
+	@echo ""
+	@echo "HDF5_CFLAGS from pkg-config: $(shell pkg-config --cflags hdf5 2>/dev/null)"
+	@echo "HDF5_LDFLAGS from pkg-config: $(shell pkg-config --libs hdf5 2>/dev/null)"
+	@echo ""
+	@echo "Common HDF5 locations:"
+	@for dir in /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/local/lib /opt/hdf5/lib; do \
+		if [ -d "$$dir" ] && ls $$dir/libhdf5.so* >/dev/null 2>&1; then \
+			echo "  Found: $$dir/libhdf5.so"; \
+		fi; \
+	done
+
+.PHONY: all clean install test config verify-hdf5
