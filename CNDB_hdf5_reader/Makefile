@@ -173,7 +173,7 @@ config:
 	@echo "To override, use: make VMD_DIR=/path/to/vmd HDF5_PREFIX=/path/to/hdf5"
 
 $(PLUGIN): cndbplugin.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $(PLUGIN) cndbplugin.c
+	$(CC) $(CFLAGS) -o $(PLUGIN) cndbplugin.c $(LDFLAGS)
 
 clean:
 	rm -f $(PLUGIN) *.o
