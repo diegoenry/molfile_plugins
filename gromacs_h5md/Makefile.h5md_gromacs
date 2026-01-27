@@ -90,6 +90,13 @@ CFLAGS += $(HDF5_CFLAGS)
 LDFLAGS = $(PLUGIN_LDFLAGS)
 LDFLAGS += $(HDF5_LIBS)
 
+# Add rpath for runtime library discovery on Linux
+ifeq ($(UNAME_S),Linux)
+    ifneq ($(HDF5_LIB),)
+        LDFLAGS += -Wl,-rpath,$(HDF5_LIB)
+    endif
+endif
+
 # Source and output
 SRC = h5mdplugin_gromacs.c
 OBJ = h5mdplugin_gromacs.o
