@@ -1,0 +1,221 @@
+GROMACS
+-------
+
+### Objective
+
+This module identifies H5MD files created by GROMACS and provides basic metadata
+about the GROMACS software version used to create the file. It serves as a marker
+that the file was produced by GROMACS and may contain GROMACS-specific modules
+or conventions.
+
+### Module name and version
+
+The name of this module is `gromacs`. The module version is 0.1.0.
+
+**Note**: This module is marked as experimental (major version = 0) per semantic
+versioning rules. Breaking changes may occur until the module is stabilized at
+version 1.0.0.
+
+### Module location
+
+This module is declared in `/h5md/modules/gromacs` with optional metadata stored
+as attributes.
+
+### Data structure
+
+    h5md
+     \-- modules
+          \-- gromacs
+               +-- version: Integer[2]
+               +-- (url: String[])
+
+### Module attributes
+
+`version`
+:   A required attribute of `Integer` datatype and simple dataspace of rank 1
+    and size 2 that contains the major and minor version numbers of this module
+    (`[0, 1]` for the current experimental version).
+
+    Per semantic versioning rules:
+    - **Major version 0**: Experimental; breaking changes may occur
+    - **Major version 1+**: Stable; major version increments indicate breaking changes
+    - **Minor version**: New backwards-compatible features
+
+`url`
+:   An optional attribute of fixed-length string datatype and scalar dataspace
+    that contains a URL pointing to GROMACS project information. This is not
+    required by H5MD module specification but provides additional information
+    for users. Typically set to "https://www.gromacs.org".
+
+### Relation to other H5MD elements
+
+This module works in conjunction with core H5MD metadata:
+
+- `/h5md/creator/name`: Should be set to "GROMACS"
+- `/h5md/creator/version`: Contains the GROMACS version string (e.g., "2026.0")
+- `/h5md/modules/gromacs`: Declares this module and its version
+
+The presence of this module in `/h5md/modules/` indicates that:
+
+1. The file was created by GROMACS software
+2. GROMACS-specific conventions may be used
+3. Additional GROMACS-specific modules may be present (e.g., `gromacs_topology`)
+4. Data structures follow GROMACS interpretations of the H5MD specification
+
+### Typical usage
+
+This module is automatically created by GROMACS when writing H5MD files. It requires
+no user intervention or configuration.
+
+**In GROMACS code**:
+```cpp
+// Setup GROMACS module
+constexpr char name[] = "gromacs";
+constexpr int  version[] = { 0, 1 };
+constexpr char url[]     = "https://www.gromacs.org";
+
+hid_t group = H5Gcreate(modulesGroup, name, ...);
+H5LTset_attribute_int(group, ".", "version", version, 2);
+H5LTset_attribute_string(group, ".", "url", url);
+```
+
+### Module scope
+
+This module provides:
+
+- **Software identification**: Marks file as GROMACS-produced
+- **Version tracking**: Records module version for compatibility checking
+- **Reference information**: Provides URL for GROMACS documentation
+
+This module does NOT provide:
+
+- Detailed GROMACS version information (use `/h5md/creator/version`)
+- Topology information (use `gromacs_topology` module)
+- Force field parameters (use `forcefield` module)
+- Simulation parameters (use `simulation_parameters` module)
+
+### Compatibility
+
+Files with this module remain valid H5MD files. Software that does not recognize
+the `gromacs` module can:
+
+- Ignore the module entirely
+- Read trajectory and topology data using core H5MD elements
+- Access data in other modules they understand
+
+GROMACS-aware software should:
+
+- Check for presence of this module to identify GROMACS files
+- Validate module version for compatibility
+- Look for associated GROMACS-specific modules (`gromacs_topology`)
+
+### Validation
+
+Valid `gromacs` modules must satisfy:
+
+1. Module group exists at `/h5md/modules/gromacs`
+2. `version` attribute present and is Integer[2]
+3. Version follows semantic versioning (currently `[0, 1]`)
+4. If present, `url` is a valid string
+
+### Example
+
+Typical H5MD metadata structure with GROMACS module:
+
+```
+h5md/
+  version: [1, 1]
+  author/
+    name: "John Doe"
+  creator/
+    name: "GROMACS"
+    version: "2026.0"
+  modules/
+    gromacs/
+      version: [0, 1]
+      url: "https://www.gromacs.org"
+    units/
+      version: [1, 0]
+      system: "SI"
+    gromacs_topology/
+      version: [0, 1]
+      ...
+```
+
+### Relation to other modules
+
+This module is often present alongside:
+
+- **units module** (required): GROMACS sets unit system to "SI"
+- **gromacs_topology module** (typical): GROMACS-specific topology storage
+- **topology module** (optional): Generic topology if using proposed standard
+- **connectivity module** (typical): Bond connectivity information
+- **simulation_parameters module** (optional): Full simulation details
+
+### Future extensions
+
+Future versions may add:
+
+1. **GROMACS version tracking**: Store detailed GROMACS version that created file
+   (currently in `/h5md/creator/version`, might be duplicated here)
+
+2. **Feature flags**: Indicate which GROMACS features were used (e.g., "virtual_sites",
+   "free_energy", "pull_code")
+
+3. **Build information**: Compiler, precision (single/double), GPU support
+
+4. **File type**: Distinguish trajectory vs. energy vs. checkpoint files
+
+Changes that break compatibility will increment major version to 1.0.
+
+### Implementation details
+
+**When is this module created?**
+
+This module is created by GROMACS when:
+- Writing H5MD trajectory files with `gmx mdrun -o traj.h5`
+- Converting trajectories with `gmx trjconv -o traj.h5`
+- Using H5MD format in any GROMACS I/O operation
+
+**Module setup code location** (GROMACS source):
+```
+src/gromacs/fileio/h5md/h5md.cpp: setupGromacsModule()
+```
+
+### Performance considerations
+
+This module adds minimal overhead:
+- One HDF5 group creation
+- Two small attributes (version array, optional URL string)
+- No datasets
+- Negligible file size impact (< 1 KB)
+
+### Backwards compatibility
+
+**Reading old files**: GROMACS can read H5MD files without this module (standard
+H5MD files from other software).
+
+**Forward compatibility**: Older GROMACS versions may not recognize files with
+newer module versions. Module version checking allows graceful degradation or
+error messages.
+
+**Inter-software compatibility**: Non-GROMACS software can ignore this module
+and still read trajectory data using core H5MD specification.
+
+### See also
+
+- **gromacs_topology module**: GROMACS-specific topology storage
+- **H5MD specification**: https://www.nongnu.org/h5md/
+- **GROMACS H5MD documentation**: GROMACS manual, file formats section
+
+### Authors
+
+- Petter Johansson <pettjoha@kth.se>
+- Magnus Lundborg <lundborg.magnus@gmail.com>
+- Yang Zhang <yang.zhang@scilifelab.se>
+
+### References
+
+- GROMACS project: https://www.gromacs.org
+- GROMACS H5MD implementation: `src/gromacs/fileio/h5md/` in GROMACS source
+- Semantic versioning: https://semver.org/

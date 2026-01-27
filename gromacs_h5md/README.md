@@ -1,4 +1,22 @@
-# Build instructions tested for MacOSX Sequoia 15.7.3
+# GROMACS H5MD Plugin for VMD 2.x (1.9.4)
+
+University of Illinois Open Source License
+
+Reads H5MD trajectory files produced by GROMACS 2026.0+ with the
+gromacs_topology module extension.
+
+Author: Diego E. B. Gomes - Auburn University, Alabama, AL - USA 
+E-mail: dgomes@auburn.edu 
+Version: 0.1
+
+# WARNING: 
+This is a temporary location, plugin will be moved to VMD 2.0 plugin source tree when validated.
+
+# WARNING 2:
+The modules gromacs.mdwn and gromacs_topology.mdwn are not official GROMACS files, and certainly incomplete specifications. They're my interpretation of the GROMCAS 2026.0 source code and the h5md I had on my hands. 
+
+
+# Plugin build instructions tested for MacOSX Sequoia 15.7.3
 
 #  Build Dependencies                                                                                                                                                                                          
   Essential:                                                                                            
@@ -33,7 +51,6 @@
 
 ```
 # Export VMD_DIR to point to VMD source code (1.9.4 or 2.0a9)
-
 export VMD_DIR=/Users/deb0054/gitlab/vmd2prototype/vmd/
                                                                                                         
 # Check configuration                                                                                 
