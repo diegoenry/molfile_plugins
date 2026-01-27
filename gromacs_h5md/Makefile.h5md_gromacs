@@ -111,7 +111,7 @@ all: $(TARGET)
 # Build plugin
 $(TARGET): $(OBJ)
 	@echo "Linking $(TARGET)..."
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) -o $@ $^ $(LDFLAGS)
 	@echo "Build complete: $(TARGET)"
 
 $(OBJ): $(SRC)
