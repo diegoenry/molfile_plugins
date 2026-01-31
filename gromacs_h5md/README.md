@@ -3,6 +3,8 @@
 University of Illinois Open Source License
 
 The authors of the original VMD_H5MD plugin released it under GPL, so we needed to write a brand new one if we want to distribute it with VMD.
+**Since H5MD is GPL_v3 I can't really redistribute the specification!!!**, only the GROMACS module.
+Although I wrote the .mdwn module files, I credited then to the authors of GROMACS source for writing H5MD.
 
 Reads H5MD trajectory files produced by GROMACS 2026.0+ with the gromacs and 
 gromacs_topology module extension.
