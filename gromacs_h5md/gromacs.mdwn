@@ -210,9 +210,8 @@ and still read trajectory data using core H5MD specification.
 
 ### Authors
 
-- Petter Johansson <pettjoha@kth.se>
-- Magnus Lundborg <lundborg.magnus@gmail.com>
-- Yang Zhang <yang.zhang@scilifelab.se>
+- Petter Johansson
+- Yang Zhang
 
 ### References
 
