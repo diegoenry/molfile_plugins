@@ -341,8 +341,7 @@ is found in:
 - `src/gromacs/fileio/h5md/h5md.cpp` (setup and integration)
 - `src/gromacs/fileio/h5md/h5md_topologyutils.cpp` (topology writing utilities)
 
-### Authors
+### Authors - Attributed from what I found in GROMACS code. 
 
-- Petter Johansson <pettjoha@kth.se>
-- Magnus Lundborg <lundborg.magnus@gmail.com>
-- Yang Zhang <yang.zhang@scilifelab.se>
+- Petter Johansson
+- Yang Zhang 
