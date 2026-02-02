@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GROMACS H5MD Browser</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <!-- Mol* CSS -->
+    <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.css">
+</head>
+<body>
+    <header>
+        <h1>GROMACS H5MD Browser</h1>
+        <div style="display: flex; align-items: center; gap: 1.5rem;">
+            <span id="current-file">No file selected</span>
+            <div class="theme-switcher">
+                <label for="theme-select">Theme:</label>
+                <select id="theme-select">
+                    <optgroup label="Standard">
+                        <option value="dark">Cosmic Dark</option>
+                        <option value="light">Light</option>
+                        <option value="contrast">High Contrast</option>
+                    </optgroup>
+                    <optgroup label="Alternative Dark">
+                        <option value="midnight">Midnight Blue</option>
+                        <option value="forest">Forest Green</option>
+                        <option value="purple">Warm Purple</option>
+                    </optgroup>
+                    <optgroup label="Scientific">
+                        <option value="vmd">VMD</option>
+                        <option value="pymol">PyMOL</option>
+                        <option value="chimera">Chimera</option>
+                    </optgroup>
+                </select>
+            </div>
+        </div>
+    </header>
+
+    <div class="container">
+        <aside class="sidebar">
+            <div class="sidebar-header">
+                <h2>H5MD Files</h2>
+                <button id="browse-folder-btn" class="browse-btn" title="Browse for folder">📁</button>
+            </div>
+            <div id="current-directory" class="current-directory" title="Click to change folder">
+                <span id="directory-path">Loading...</span>
+            </div>
+            <div id="file-list" class="file-list">
+                <p class="loading">Loading files...</p>
+            </div>
+        </aside>
+
+        <!-- Folder Browser Modal -->
+        <div id="folder-modal" class="modal" style="display: none;">
+            <div class="modal-content folder-browser">
+                <div class="modal-header">
+                    <h3>Select Folder</h3>
+                    <button id="close-folder-modal" class="close-btn">&times;</button>
+                </div>
+                <div class="folder-path-bar">
+                    <button id="folder-up-btn" class="folder-nav-btn" title="Go to parent folder">⬆️</button>
+                    <input type="text" id="folder-path-input" class="folder-path-input" placeholder="Enter path...">
+                    <button id="folder-go-btn" class="folder-nav-btn" title="Go to path">Go</button>
+                </div>
+                <div id="folder-list" class="folder-list">
+                    <p class="loading">Loading...</p>
+                </div>
+                <div class="modal-footer">
+                    <span id="folder-h5md-count" class="h5md-count"></span>
+                    <button id="folder-select-btn" class="primary">Select This Folder</button>
+                </div>
+            </div>
+        </div>
+
+        <main class="content">
+            <nav class="tabs">
+                <button class="tab active" data-tab="summary">Summary</button>
+                <button class="tab" data-tab="viewer3d">3D View</button>
+                <button class="tab" data-tab="topology">Topology</button>
+                <button class="tab" data-tab="particles">Particles</button>
+                <button class="tab" data-tab="connectivity">Connectivity</button>
+                <button class="tab" data-tab="frames">Frames</button>
+                <button class="tab" data-tab="structure">Structure</button>
+            </nav>
+
+            <div class="tab-content">
+                <section id="summary" class="tab-pane active">
+                    <div id="summary-content">
+                        <p class="placeholder">Select a file to view its summary</p>
+                    </div>
+                </section>
+
+                <section id="viewer3d" class="tab-pane">
+                    <div class="viewer-container">
+                        <!-- Molecule Selection Panel -->
+                        <div id="mol-selector-panel" class="mol-selector-panel">
+                            <div class="mol-selector-header">
+                                <h3>Select Molecule Types to Load</h3>
+                                <p class="mol-selector-hint">Uncheck water/solvent for faster loading</p>
+                            </div>
+                            <div id="mol-selector-list" class="mol-selector-list">
+                                <p class="loading">Loading molecule types...</p>
+                            </div>
+                            <div class="mol-selector-actions">
+                                <button id="mol-select-all">Select All</button>
+                                <button id="mol-select-none">Select None</button>
+                                <button id="mol-select-protein">Protein Only</button>
+                            </div>
+                            <div class="mol-selector-trajectory">
+                                <h4>Trajectory Options</h4>
+                                <div class="traj-option">
+                                    <label>
+                                        <input type="radio" name="load-mode" value="single" checked>
+                                        Single frame (faster loading)
+                                    </label>
+                                </div>
+                                <div class="traj-option">
+                                    <label>
+                                        <input type="radio" name="load-mode" value="trajectory">
+                                        Full trajectory (for animation)
+                                    </label>
+                                </div>
+                                <div id="traj-options-detail" class="traj-options-detail" style="display: none;">
+                                    <label>
+                                        Frame step:
+                                        <select id="traj-step">
+                                            <option value="1">Every frame</option>
+                                            <option value="2">Every 2nd frame</option>
+                                            <option value="5" selected>Every 5th frame</option>
+                                            <option value="10">Every 10th frame</option>
+                                            <option value="20">Every 20th frame</option>
+                                        </select>
+                                    </label>
+                                    <span id="traj-frame-count" class="traj-info"></span>
+                                </div>
+                            </div>
+                            <div class="mol-selector-load">
+                                <button id="mol-load-btn" class="primary">Load Structure</button>
+                            </div>
+                            <div class="mol-selector-summary">
+                                <span id="mol-selected-atoms">Selected atoms: 0</span>
+                            </div>
+                        </div>
+
+                        <!-- Viewer Panel (hidden until structure is loaded) -->
+                        <div id="viewer-panel" class="viewer-panel" style="display: none;">
+                            <div class="viewer-controls">
+                                <div class="viewer-frame-controls">
+                                    <button id="viewer-first" title="First frame">&laquo;</button>
+                                    <button id="viewer-prev" title="Previous frame">&lt;</button>
+                                    <span id="viewer-frame-label">Frame: 0 / 0</span>
+                                    <button id="viewer-next" title="Next frame">&gt;</button>
+                                    <button id="viewer-last" title="Last frame">&raquo;</button>
+                                    <button id="viewer-play" title="Play/Pause">&#9654;</button>
+                                </div>
+                                <div class="viewer-options">
+                                    <label>
+                                        Max atoms:
+                                        <select id="viewer-max-atoms">
+                                            <option value="5000">5,000</option>
+                                            <option value="10000">10,000</option>
+                                            <option value="25000">25,000</option>
+                                            <option value="50000" selected>50,000</option>
+                                            <option value="100000">100,000</option>
+                                        </select>
+                                    </label>
+                                    <button id="viewer-reset" title="Reset view">Reset View</button>
+                                    <button id="viewer-change-selection" title="Change molecule selection">Change Selection</button>
+                                </div>
+                            </div>
+                            <div id="molstar-viewer"></div>
+                            <div id="viewer-info" class="viewer-info">
+                                <span id="viewer-atoms">Atoms: -</span>
+                                <span id="viewer-time">Time: -</span>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section id="topology" class="tab-pane">
+                    <div id="topology-content">
+                        <p class="placeholder">Select a file to view topology</p>
+                    </div>
+                </section>
+
+                <section id="particles" class="tab-pane">
+                    <div id="particles-content">
+                        <p class="placeholder">Select a file to view particles info</p>
+                    </div>
+                </section>
+
+                <section id="connectivity" class="tab-pane">
+                    <div id="connectivity-content">
+                        <p class="placeholder">Select a file to view connectivity</p>
+                    </div>
+                </section>
+
+                <section id="frames" class="tab-pane">
+                    <div class="frame-controls">
+                        <button id="frame-first" title="First frame">&laquo;</button>
+                        <button id="frame-prev" title="Previous frame">&lt;</button>
+                        <span id="frame-label">Frame: 0 / 0</span>
+                        <button id="frame-next" title="Next frame">&gt;</button>
+                        <button id="frame-last" title="Last frame">&raquo;</button>
+                    </div>
+                    <div id="frames-content">
+                        <p class="placeholder">Select a file to view frame data</p>
+                    </div>
+                </section>
+
+                <section id="structure" class="tab-pane">
+                    <div id="structure-content">
+                        <p class="placeholder">Select a file to view HDF5 structure</p>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <!-- Mol* JavaScript -->
+    <script src="https://cdn.jsdelivr.net/npm/molstar@latest/build/viewer/molstar.js"></script>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
