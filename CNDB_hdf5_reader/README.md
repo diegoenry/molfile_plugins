@@ -172,6 +172,8 @@ play
 ```
 
 ### Smooth Tube Representation
+This a hack and is extremelly slow ! 
+We'll have NewTubes use it natively in VMD 2.0a10 or a11, together with Martini3.
 
 ```tcl
 # Load CNDB file (single frame for tube)
