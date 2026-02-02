@@ -2,6 +2,8 @@
 
 A web-based file viewer and analyzer for H5MD (Hierarchical Data Format for Molecular Dynamics) files produced by GROMACS. Browse, explore, and visualize molecular dynamics trajectory data through a modern interface with interactive 3D structure viewing.
 
+https://github.com/user-attachments/assets/57d6aa2f-08ac-4b7d-8ad0-dae802ebbe2a
+
 ## Features
 
 - **File Browser**: Navigate directories and select H5MD files with real-time file listing
@@ -121,7 +123,3 @@ gromacs_h5md_webBrowser/
 ## License
 
 Part of the molfile_plugins project.
-
-
-
-<video src="Gromacs_H5MD_Browser.mp4.mp4" width="320" height="240" controls></video>
