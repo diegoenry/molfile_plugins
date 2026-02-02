@@ -121,3 +121,7 @@ gromacs_h5md_webBrowser/
 ## License
 
 Part of the molfile_plugins project.
+
+
+
+<video src="Gromacs_H5MD_Browser.mp4.mp4" width="320" height="240" controls></video>
