@@ -19,27 +19,27 @@
  * Features:
  *   - Reads atomic structure from GROMACS topology module
  *   - Loads trajectory frames with positions
- *   - Optional velocities and forces
- *   - Periodic boundary conditions (orthogonal boxes)
- *   - Atom selection via VMD_H5MD_SELECTION environment variable
+ *   - Optional velocities
+ *   - Bond connectivity from /connectivity/bonds
+ *   - Periodic boundary conditions (orthogonal and triclinic boxes)
  *
  * Limitations:
- *   - No bond connectivity (GROMACS bond data not read)
  *   - Thread-unsafe (HDF5 library limitation)
- *   - Orthogonal boxes only (triclinic support planned)
+ *   - Forces are not read
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 #include <hdf5.h>
 
 #include "molfile_plugin.h"
 
-/* Plugin version */
-#define H5MD_GROMACS_VERSION_MAJOR 1
-#define H5MD_GROMACS_VERSION_MINOR 0
+/* Plugin version (experimental; matches the 0.1 module spec) */
+#define H5MD_GROMACS_VERSION_MAJOR 0
+#define H5MD_GROMACS_VERSION_MINOR 1
 
 /* Unit conversion: nm to Angstroms */
 #define NM_TO_ANGSTROM 10.0f
@@ -75,9 +75,9 @@ typedef struct {
     int32_t *species;                /* Atomic numbers (Z) */
     int32_t *residue_ids;            /* Residue IDs within molecule */
 
-    /* Decoded names (from lookup tables) */
-    char **particle_names;           /* Atom names */
-    char **residue_names;            /* Residue names */
+    /* Decoded names (from lookup tables), one entry per particle */
+    char **particle_names;           /* Atom names (per particle) */
+    char **atom_residue_names;       /* Residue name resolved per particle */
 } molecule_type_t;
 
 /*
@@ -104,16 +104,11 @@ typedef struct {
 
     /* Optional data flags */
     int has_velocities;
-    int has_forces;
 
     /* Bond connectivity */
     int nbonds;
     int *bond_from;                  /* Bond start atom indices */
     int *bond_to;                    /* Bond end atom indices */
-
-    /* Selection support */
-    char selection_string[MAX_NAME_LEN];
-    int *file_to_vmd_index;          /* Maps file atom to VMD atom (-1 if filtered) */
 
     /* Cached file path for error messages */
     char filename[MAX_NAME_LEN];
@@ -203,16 +198,23 @@ static char **h5_read_vlen_string_dataset(hid_t dataset_id, int *num_strings) {
         free(rdata);
         H5Tclose(mem_dtype_id);
     } else {
-        /* Fixed-length strings */
+        /* Fixed-length strings. The read buffer MUST be sized by the file's real
+         * element width (str_size); only the per-element copy into strings[] is
+         * capped at MAX_ATOM_NAME. Clamping the buffer stride would overflow it. */
         str_size = H5Tget_size(file_dtype_id);
-        if (str_size == 0 || str_size > MAX_ATOM_NAME) {
+        if (str_size == 0) {
             str_size = MAX_ATOM_NAME;
         }
 
-        buffer = (char *)malloc(*num_strings * str_size);
-        if (H5Dread(dataset_id, file_dtype_id, H5S_ALL, H5S_ALL, H5P_DEFAULT, buffer) >= 0) {
+        buffer = (char *)malloc((size_t)(*num_strings) * str_size);
+        if (buffer && H5Dread(dataset_id, file_dtype_id, H5S_ALL, H5S_ALL, H5P_DEFAULT, buffer) >= 0) {
             for (i = 0; i < *num_strings; i++) {
-                safe_strcpy(strings[i], buffer + i * str_size, MAX_ATOM_NAME);
+                /* Fixed-length HDF5 strings are not guaranteed NUL-terminated when
+                 * they fill the field, so bound the copy by both str_size and the
+                 * destination capacity. */
+                size_t n = str_size < MAX_ATOM_NAME ? str_size : (size_t)(MAX_ATOM_NAME - 1);
+                memcpy(strings[i], buffer + (size_t)i * str_size, n);
+                strings[i][n] = '\0';
             }
         }
         free(buffer);
@@ -241,12 +243,23 @@ static void free_molecule_type(molecule_type_t *moltype) {
         free(moltype->particle_names);
     }
 
-    if (moltype->residue_names) {
-        for (i = 0; i < moltype->residue_count; i++) {
-            if (moltype->residue_names[i]) free(moltype->residue_names[i]);
+    if (moltype->atom_residue_names) {
+        for (i = 0; i < moltype->particle_count; i++) {
+            if (moltype->atom_residue_names[i]) free(moltype->atom_residue_names[i]);
         }
-        free(moltype->residue_names);
+        free(moltype->atom_residue_names);
     }
+}
+
+/* Angle (degrees) between two 3-vectors; returns 90 for degenerate input. */
+static double vec_angle_deg(const double u[3], const double v[3]) {
+    double lu = sqrt(u[0]*u[0] + u[1]*u[1] + u[2]*u[2]);
+    double lv = sqrt(v[0]*v[0] + v[1]*v[1] + v[2]*v[2]);
+    if (lu <= 0.0 || lv <= 0.0) return 90.0;
+    double c = (u[0]*v[0] + u[1]*v[1] + u[2]*v[2]) / (lu * lv);
+    if (c > 1.0) c = 1.0;
+    if (c < -1.0) c = -1.0;
+    return acos(c) * (180.0 / M_PI);
 }
 
 /*
@@ -262,7 +275,7 @@ static int decode_molecule_type(hid_t group_id, molecule_type_t *moltype) {
     int32_t *residue_name_indices = NULL;
     char **particle_name_table = NULL;
     char **residue_name_table = NULL;
-    int num_particle_names, num_residue_names;
+    int num_particle_names = 0, num_residue_names = 0;
     int i;
 
     /* Read attributes */
@@ -276,16 +289,24 @@ static int decode_molecule_type(hid_t group_id, molecule_type_t *moltype) {
         return H5MD_ERROR;
     }
 
-    /* Allocate arrays */
+    if (moltype->particle_count <= 0) {
+        fprintf(stderr, "h5mdplugin_gromacs) Invalid particle_count (%d)\n", moltype->particle_count);
+        return H5MD_ERROR;
+    }
+
+    /* Allocate arrays. The per-particle pointer arrays are calloc'd so that a
+     * partially-populated molecule type can be freed safely on error. */
     moltype->ids = (int64_t *)malloc(moltype->particle_count * sizeof(int64_t));
     moltype->masses = (float *)malloc(moltype->particle_count * sizeof(float));
     moltype->charges = (float *)malloc(moltype->particle_count * sizeof(float));
     moltype->species = (int32_t *)malloc(moltype->particle_count * sizeof(int32_t));
     moltype->residue_ids = (int32_t *)malloc(moltype->particle_count * sizeof(int32_t));
-    moltype->particle_names = (char **)malloc(moltype->particle_count * sizeof(char *));
+    moltype->particle_names = (char **)calloc(moltype->particle_count, sizeof(char *));
+    moltype->atom_residue_names = (char **)calloc(moltype->particle_count, sizeof(char *));
 
     if (!moltype->ids || !moltype->masses || !moltype->charges ||
-        !moltype->species || !moltype->residue_ids || !moltype->particle_names) {
+        !moltype->species || !moltype->residue_ids ||
+        !moltype->particle_names || !moltype->atom_residue_names) {
         fprintf(stderr, "h5mdplugin_gromacs) Memory allocation failed\n");
         return H5MD_ERROR;
     }
@@ -347,24 +368,30 @@ static int decode_molecule_type(hid_t group_id, molecule_type_t *moltype) {
 
     /* Read particle_name indices */
     particle_name_indices = (int32_t *)malloc(moltype->particle_count * sizeof(int32_t));
+    if (!particle_name_indices) {
+        fprintf(stderr, "h5mdplugin_gromacs) Memory allocation failed\n");
+        goto decode_error;
+    }
     dataset_id = H5Dopen(group_id, "particle_name", H5P_DEFAULT);
     if (dataset_id < 0 || H5Dread(dataset_id, H5T_NATIVE_INT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, particle_name_indices) < 0) {
         fprintf(stderr, "h5mdplugin_gromacs) Error reading particle_name indices\n");
         if (dataset_id >= 0) H5Dclose(dataset_id);
-        free(particle_name_indices);
-        return H5MD_ERROR;
+        goto decode_error;
     }
     H5Dclose(dataset_id);
 
-    /* Decode particle names */
+    /* Decode particle names (one per particle) */
     for (i = 0; i < moltype->particle_count; i++) {
         int idx = particle_name_indices[i];
+        moltype->particle_names[i] = (char *)malloc(MAX_ATOM_NAME);
+        if (!moltype->particle_names[i]) {
+            fprintf(stderr, "h5mdplugin_gromacs) Memory allocation failed\n");
+            goto decode_error;
+        }
         if (idx >= 0 && idx < num_particle_names) {
-            moltype->particle_names[i] = (char *)malloc(MAX_ATOM_NAME);
             safe_strcpy(moltype->particle_names[i], particle_name_table[idx], MAX_ATOM_NAME);
         } else {
-            moltype->particle_names[i] = (char *)malloc(MAX_ATOM_NAME);
-            strcpy(moltype->particle_names[i], "X");
+            safe_strcpy(moltype->particle_names[i], "X", MAX_ATOM_NAME);
         }
     }
 
@@ -372,63 +399,51 @@ static int decode_molecule_type(hid_t group_id, molecule_type_t *moltype) {
     dataset_id = H5Dopen(group_id, "residue_name_table", H5P_DEFAULT);
     if (dataset_id < 0) {
         fprintf(stderr, "h5mdplugin_gromacs) Error opening residue_name_table\n");
-        free(particle_name_indices);
-        for (i = 0; i < num_particle_names; i++) free(particle_name_table[i]);
-        free(particle_name_table);
-        return H5MD_ERROR;
+        goto decode_error;
     }
     residue_name_table = h5_read_vlen_string_dataset(dataset_id, &num_residue_names);
     H5Dclose(dataset_id);
 
     if (!residue_name_table) {
         fprintf(stderr, "h5mdplugin_gromacs) Error reading residue_name_table\n");
-        free(particle_name_indices);
-        for (i = 0; i < num_particle_names; i++) free(particle_name_table[i]);
-        free(particle_name_table);
-        return H5MD_ERROR;
+        goto decode_error;
     }
 
-    /* Read residue_name indices */
+    /* Read residue_name indices (one per particle) */
     residue_name_indices = (int32_t *)malloc(moltype->particle_count * sizeof(int32_t));
+    if (!residue_name_indices) {
+        fprintf(stderr, "h5mdplugin_gromacs) Memory allocation failed\n");
+        goto decode_error;
+    }
     dataset_id = H5Dopen(group_id, "residue_name", H5P_DEFAULT);
     if (dataset_id < 0 || H5Dread(dataset_id, H5T_NATIVE_INT32, H5S_ALL, H5S_ALL, H5P_DEFAULT, residue_name_indices) < 0) {
         fprintf(stderr, "h5mdplugin_gromacs) Error reading residue_name indices\n");
         if (dataset_id >= 0) H5Dclose(dataset_id);
-        free(particle_name_indices);
-        free(residue_name_indices);
-        for (i = 0; i < num_particle_names; i++) free(particle_name_table[i]);
-        free(particle_name_table);
-        for (i = 0; i < num_residue_names; i++) free(residue_name_table[i]);
-        free(residue_name_table);
-        return H5MD_ERROR;
+        goto decode_error;
     }
     H5Dclose(dataset_id);
 
-    /* Decode residue names and store unique ones */
-    moltype->residue_names = (char **)malloc(moltype->residue_count * sizeof(char *));
-    for (i = 0; i < moltype->residue_count; i++) {
-        moltype->residue_names[i] = (char *)malloc(MAX_RESIDUE_NAME);
-
-        /* Find first atom with this residue ID */
-        int j;
-        for (j = 0; j < moltype->particle_count; j++) {
-            if (moltype->residue_ids[j] == i + 1) {  /* Residue IDs are 1-based */
-                int idx = residue_name_indices[j];
-                if (idx >= 0 && idx < num_residue_names) {
-                    safe_strcpy(moltype->residue_names[i], residue_name_table[idx], MAX_RESIDUE_NAME);
-                } else {
-                    strcpy(moltype->residue_names[i], "UNK");
-                }
-                break;
-            }
+    /* Resolve the residue name for each particle directly from the per-particle
+     * residue_name index. NOTE: residue_id is intentionally NOT used as a table
+     * index. GROMACS writes residue_id = resind + 1 (values run 2..residue_count+1,
+     * not 1..residue_count), so indexing a per-type residue table by residue_id
+     * mislabels every single-residue molecule (water, ions) and the last residue
+     * of each chain as "UNK". The per-particle residue_name index is authoritative. */
+    for (i = 0; i < moltype->particle_count; i++) {
+        int idx = residue_name_indices[i];
+        moltype->atom_residue_names[i] = (char *)malloc(MAX_RESIDUE_NAME);
+        if (!moltype->atom_residue_names[i]) {
+            fprintf(stderr, "h5mdplugin_gromacs) Memory allocation failed\n");
+            goto decode_error;
         }
-
-        if (j == moltype->particle_count) {
-            strcpy(moltype->residue_names[i], "UNK");
+        if (idx >= 0 && idx < num_residue_names) {
+            safe_strcpy(moltype->atom_residue_names[i], residue_name_table[idx], MAX_RESIDUE_NAME);
+        } else {
+            safe_strcpy(moltype->atom_residue_names[i], "UNK", MAX_RESIDUE_NAME);
         }
     }
 
-    /* Cleanup */
+    /* Cleanup (success). moltype's own arrays are owned by the caller. */
     free(particle_name_indices);
     free(residue_name_indices);
     for (i = 0; i < num_particle_names; i++) free(particle_name_table[i]);
@@ -437,6 +452,21 @@ static int decode_molecule_type(hid_t group_id, molecule_type_t *moltype) {
     free(residue_name_table);
 
     return H5MD_SUCCESS;
+
+decode_error:
+    /* Free only the local scratch buffers; moltype's arrays are released by the
+     * caller via free_molecule_type(). */
+    if (particle_name_indices) free(particle_name_indices);
+    if (residue_name_indices) free(residue_name_indices);
+    if (particle_name_table) {
+        for (i = 0; i < num_particle_names; i++) free(particle_name_table[i]);
+        free(particle_name_table);
+    }
+    if (residue_name_table) {
+        for (i = 0; i < num_residue_names; i++) free(residue_name_table[i]);
+        free(residue_name_table);
+    }
+    return H5MD_ERROR;
 }
 
 /*
@@ -465,6 +495,13 @@ static void *open_h5md_gromacs_read(const char *filepath, const char *filetype, 
     }
 
     safe_strcpy(h5md->filename, filepath, MAX_NAME_LEN);
+
+    /* calloc leaves hid_t fields at 0, which is not a valid handle. Initialize
+     * the optional trajectory handles to -1 so "< 0" / ">= 0" guards behave. */
+    h5md->position_dataset = -1;
+    h5md->velocity_dataset = -1;
+    h5md->box_dataset = -1;
+    h5md->time_dataset = -1;
 
     /* Disable HDF5 error messages to stderr */
     H5Eset_auto(H5E_DEFAULT, NULL, NULL);
@@ -505,17 +542,46 @@ static void *open_h5md_gromacs_read(const char *filepath, const char *filetype, 
 
     attr_id = H5Aopen(topology_group, "molecule_block_names", H5P_DEFAULT);
     aspace_id = H5Aget_space(attr_id);
-    H5Sget_simple_extent_dims(aspace_id, attr_dims, NULL);
+    attr_dims[0] = 0;
+    if (attr_id < 0 || aspace_id < 0 ||
+        H5Sget_simple_extent_dims(aspace_id, attr_dims, NULL) < 0 ||
+        (int)attr_dims[0] <= 0) {
+        fprintf(stderr, "h5mdplugin_gromacs) Invalid molecule_block_names attribute\n");
+        if (aspace_id >= 0) H5Sclose(aspace_id);
+        if (attr_id >= 0) H5Aclose(attr_id);
+        H5Gclose(topology_group);
+        H5Fclose(h5md->file_id);
+        free(h5md);
+        return NULL;
+    }
     h5md->num_molecule_types = (int)attr_dims[0];
 
     /* Get attribute datatype to check if variable-length or fixed-length */
     hid_t file_dtype_id = H5Aget_type(attr_id);
     htri_t is_vlen = H5Tis_variable_str(file_dtype_id);
 
-    /* Allocate molecule type names array */
-    moltype_names = (char **)malloc(h5md->num_molecule_types * sizeof(char *));
+    /* Allocate molecule type names array (calloc so the error path can free
+     * partially-populated slots safely). */
+    moltype_names = (char **)calloc(h5md->num_molecule_types, sizeof(char *));
+    if (!moltype_names) {
+        fprintf(stderr, "h5mdplugin_gromacs) Memory allocation failed\n");
+        H5Tclose(file_dtype_id);
+        H5Sclose(aspace_id);
+        H5Aclose(attr_id);
+        H5Gclose(topology_group);
+        H5Fclose(h5md->file_id);
+        free(h5md);
+        return NULL;
+    }
     for (i = 0; i < h5md->num_molecule_types; i++) {
         moltype_names[i] = (char *)malloc(MAX_MOLTYPE_NAME);
+        if (!moltype_names[i]) {
+            fprintf(stderr, "h5mdplugin_gromacs) Memory allocation failed\n");
+            H5Tclose(file_dtype_id);
+            H5Sclose(aspace_id);
+            H5Aclose(attr_id);
+            goto error;
+        }
         moltype_names[i][0] = '\0';
     }
 
@@ -536,16 +602,19 @@ static void *open_h5md_gromacs_read(const char *filepath, const char *filetype, 
         free(rdata);
         H5Tclose(dtype_id);
     } else {
-        /* Fixed-length strings */
+        /* Fixed-length strings: size the buffer by the real element width, cap
+         * only the per-element copy (see h5_read_vlen_string_dataset). */
         size_t str_size = H5Tget_size(file_dtype_id);
-        if (str_size == 0 || str_size > MAX_MOLTYPE_NAME) {
+        if (str_size == 0) {
             str_size = MAX_MOLTYPE_NAME;
         }
 
-        char *buffer = (char *)malloc(h5md->num_molecule_types * str_size);
-        if (H5Aread(attr_id, file_dtype_id, buffer) >= 0) {
+        char *buffer = (char *)malloc((size_t)h5md->num_molecule_types * str_size);
+        if (buffer && H5Aread(attr_id, file_dtype_id, buffer) >= 0) {
             for (i = 0; i < h5md->num_molecule_types; i++) {
-                safe_strcpy(moltype_names[i], buffer + i * str_size, MAX_MOLTYPE_NAME);
+                size_t n = str_size < MAX_MOLTYPE_NAME ? str_size : (size_t)(MAX_MOLTYPE_NAME - 1);
+                memcpy(moltype_names[i], buffer + (size_t)i * str_size, n);
+                moltype_names[i][n] = '\0';
             }
         }
         free(buffer);
@@ -557,12 +626,24 @@ static void *open_h5md_gromacs_read(const char *filepath, const char *filetype, 
 
     /* Read molecule_block_counts attribute */
     h5md->molecule_counts = (int *)malloc(h5md->num_molecule_types * sizeof(int));
+    if (!h5md->molecule_counts) {
+        fprintf(stderr, "h5mdplugin_gromacs) Memory allocation failed\n");
+        goto error;
+    }
     attr_id = H5Aopen(topology_group, "molecule_block_counts", H5P_DEFAULT);
-    H5Aread(attr_id, H5T_NATIVE_INT, h5md->molecule_counts);
+    if (attr_id < 0 || H5Aread(attr_id, H5T_NATIVE_INT, h5md->molecule_counts) < 0) {
+        fprintf(stderr, "h5mdplugin_gromacs) Error reading molecule_block_counts attribute\n");
+        if (attr_id >= 0) H5Aclose(attr_id);
+        goto error;
+    }
     H5Aclose(attr_id);
 
     /* Allocate molecule types array */
     h5md->molecule_types = (molecule_type_t *)calloc(h5md->num_molecule_types, sizeof(molecule_type_t));
+    if (!h5md->molecule_types) {
+        fprintf(stderr, "h5mdplugin_gromacs) Memory allocation failed\n");
+        goto error;
+    }
 
     /* Decode each molecule type */
     total_atoms = 0;
@@ -583,16 +664,24 @@ static void *open_h5md_gromacs_read(const char *filepath, const char *filetype, 
 
         H5Gclose(moltype_group);
 
+        if (h5md->molecule_counts[i] < 0) {
+            fprintf(stderr, "h5mdplugin_gromacs) Invalid molecule count %d for %s\n",
+                    h5md->molecule_counts[i], moltype_names[i]);
+            goto error;
+        }
+
         total_atoms += h5md->molecule_types[i].particle_count * h5md->molecule_counts[i];
         free(moltype_names[i]);
+        moltype_names[i] = NULL;  /* prevent double-free on the error path */
     }
     free(moltype_names);
     moltype_names = NULL;
 
     H5Gclose(topology_group);
+    topology_group = -1;
 
     h5md->natoms_file = total_atoms;
-    h5md->natoms = total_atoms;  /* Will be reduced by selection if applicable */
+    h5md->natoms = total_atoms;
 
     /* Open position dataset to get frame count */
     position_group = H5Gopen(h5md->file_id, "/particles/system/position", H5P_DEFAULT);
@@ -610,15 +699,25 @@ static void *open_h5md_gromacs_read(const char *filepath, const char *filetype, 
 
     /* Get dataset dimensions [nframes, natoms, 3] */
     hid_t space_id = H5Dget_space(h5md->position_dataset);
-    hsize_t dims[3];
-    H5Sget_simple_extent_dims(space_id, dims, NULL);
+    hsize_t dims[3] = {0, 0, 0};
+    if (H5Sget_simple_extent_ndims(space_id) != 3 ||
+        H5Sget_simple_extent_dims(space_id, dims, NULL) < 0) {
+        fprintf(stderr, "h5mdplugin_gromacs) Error: position/value must be a 3D [frames,atoms,3] dataset\n");
+        H5Sclose(space_id);
+        H5Gclose(position_group);
+        goto error;
+    }
     H5Sclose(space_id);
 
     h5md->nframes = (int)dims[0];
 
+    /* The plugin reconstructs the full system from the topology and reads each
+     * frame with a hyperslab sized natoms_file, so the counts must agree. */
     if ((int)dims[1] != h5md->natoms_file) {
-        fprintf(stderr, "h5mdplugin_gromacs) Warning: Position dataset atom count (%d) != topology atom count (%d)\n",
+        fprintf(stderr, "h5mdplugin_gromacs) Error: position atom count (%d) != topology atom count (%d)\n",
                 (int)dims[1], h5md->natoms_file);
+        H5Gclose(position_group);
+        goto error;
     }
 
     /* Open time dataset */
@@ -644,26 +743,6 @@ static void *open_h5md_gromacs_read(const char *filepath, const char *filetype, 
         }
     }
 
-    /* Check for selection environment variable */
-    const char *selection = getenv("VMD_H5MD_SELECTION");
-    if (selection) {
-        safe_strcpy(h5md->selection_string, selection, MAX_NAME_LEN);
-
-        /* Allocate index mapping (will be populated in read_structure) */
-        h5md->file_to_vmd_index = (int *)malloc(h5md->natoms_file * sizeof(int));
-        if (!h5md->file_to_vmd_index) {
-            fprintf(stderr, "h5mdplugin_gromacs) Memory allocation failed for index mapping\n");
-            goto error;
-        }
-
-        /* Initialize all to -1 (filtered out) */
-        for (i = 0; i < h5md->natoms_file; i++) {
-            h5md->file_to_vmd_index[i] = -1;
-        }
-
-        fprintf(stderr, "h5mdplugin_gromacs) Selection enabled: %s\n", selection);
-    }
-
     *natoms = h5md->natoms;
     h5md->current_frame = 0;
 
@@ -685,8 +764,8 @@ error:
     }
 
     if (h5md->molecule_counts) free(h5md->molecule_counts);
-    if (h5md->file_to_vmd_index) free(h5md->file_to_vmd_index);
 
+    if (topology_group >= 0) H5Gclose(topology_group);
     if (h5md->position_dataset >= 0) H5Dclose(h5md->position_dataset);
     if (h5md->velocity_dataset >= 0) H5Dclose(h5md->velocity_dataset);
     if (h5md->box_dataset >= 0) H5Dclose(h5md->box_dataset);
@@ -699,7 +778,6 @@ error:
 
 static int read_h5md_gromacs_structure(void *mydata, int *optflags, molfile_atom_t *atoms) {
     h5md_gromacs_t *h5md = (h5md_gromacs_t *)mydata;
-    int global_atom_idx = 0;
     int vmd_atom_idx = 0;
     int moltype_idx, mol_copy, atom_idx;
 
@@ -719,16 +797,14 @@ static int read_h5md_gromacs_structure(void *mydata, int *optflags, molfile_atom
                 safe_strcpy(atom->name, moltype->particle_names[atom_idx], sizeof(atom->name));
                 safe_strcpy(atom->type, moltype->particle_names[atom_idx], sizeof(atom->type));
 
-                /* Get residue info for this atom */
-                int res_id = moltype->residue_ids[atom_idx];  /* 1-based */
-                if (res_id > 0 && res_id <= moltype->residue_count) {
-                    safe_strcpy(atom->resname, moltype->residue_names[res_id - 1], sizeof(atom->resname));
-                } else {
-                    strcpy(atom->resname, "UNK");
-                }
+                /* Residue name is resolved per particle from the lookup table
+                 * (see decode_molecule_type); residue_id must not be used as a
+                 * table index because GROMACS offsets it by one. */
+                safe_strcpy(atom->resname, moltype->atom_residue_names[atom_idx], sizeof(atom->resname));
 
-                /* Offset residue ID by molecule copy to keep unique */
-                atom->resid = res_id + (mol_copy * 10000);
+                /* residue_id is already a unique per-residue key; offset by the
+                 * molecule copy so distinct copies stay distinct in VMD. */
+                atom->resid = moltype->residue_ids[atom_idx] + (mol_copy * 10000);
 
                 safe_strcpy(atom->segid, moltype->name, sizeof(atom->segid));
                 atom->chain[0] = '\0';
@@ -739,18 +815,11 @@ static int read_h5md_gromacs_structure(void *mydata, int *optflags, molfile_atom
                 atom->charge = moltype->charges[atom_idx];
                 atom->atomicnumber = moltype->species[atom_idx];
 
-                /* Update index mapping */
-                if (h5md->file_to_vmd_index) {
-                    h5md->file_to_vmd_index[global_atom_idx] = vmd_atom_idx;
-                }
-
-                global_atom_idx++;
                 vmd_atom_idx++;
             }
         }
     }
 
-    /* Update actual atom count (in case selection was applied) */
     h5md->natoms = vmd_atom_idx;
 
     return MOLFILE_SUCCESS;
@@ -762,7 +831,7 @@ static int read_h5md_gromacs_timestep(void *mydata, int natoms, molfile_timestep
     hsize_t mem_dims[2], file_start[3], file_count[3];
     float *temp_coords = NULL;
     int i;
-    (void)natoms;  /* We use h5md->natoms instead, which handles selections */
+    (void)natoms;  /* We use h5md->natoms_file, sized from the topology */
 
     /* Check EOF */
     if (h5md->current_frame >= h5md->nframes) {
@@ -811,23 +880,10 @@ static int read_h5md_gromacs_timestep(void *mydata, int natoms, molfile_timestep
     }
 
     /* Convert units: nm to Angstroms and copy to VMD format */
-    if (h5md->file_to_vmd_index) {
-        /* Selection active - copy only selected atoms */
-        for (i = 0; i < h5md->natoms_file; i++) {
-            int vmd_idx = h5md->file_to_vmd_index[i];
-            if (vmd_idx >= 0) {
-                ts->coords[3 * vmd_idx + 0] = temp_coords[3 * i + 0] * NM_TO_ANGSTROM;
-                ts->coords[3 * vmd_idx + 1] = temp_coords[3 * i + 1] * NM_TO_ANGSTROM;
-                ts->coords[3 * vmd_idx + 2] = temp_coords[3 * i + 2] * NM_TO_ANGSTROM;
-            }
-        }
-    } else {
-        /* No selection - copy all atoms */
-        for (i = 0; i < h5md->natoms_file; i++) {
-            ts->coords[3 * i + 0] = temp_coords[3 * i + 0] * NM_TO_ANGSTROM;
-            ts->coords[3 * i + 1] = temp_coords[3 * i + 1] * NM_TO_ANGSTROM;
-            ts->coords[3 * i + 2] = temp_coords[3 * i + 2] * NM_TO_ANGSTROM;
-        }
+    for (i = 0; i < h5md->natoms_file; i++) {
+        ts->coords[3 * i + 0] = temp_coords[3 * i + 0] * NM_TO_ANGSTROM;
+        ts->coords[3 * i + 1] = temp_coords[3 * i + 1] * NM_TO_ANGSTROM;
+        ts->coords[3 * i + 2] = temp_coords[3 * i + 2] * NM_TO_ANGSTROM;
     }
 
     free(temp_coords);
@@ -844,22 +900,11 @@ static int read_h5md_gromacs_timestep(void *mydata, int natoms, molfile_timestep
             mem_space = H5Screate_simple(2, mem_dims, NULL);
 
             if (H5Dread(h5md->velocity_dataset, H5T_NATIVE_FLOAT, mem_space, file_space, H5P_DEFAULT, temp_vels) >= 0) {
-                /* Convert and copy velocities */
-                if (h5md->file_to_vmd_index) {
-                    for (i = 0; i < h5md->natoms_file; i++) {
-                        int vmd_idx = h5md->file_to_vmd_index[i];
-                        if (vmd_idx >= 0) {
-                            ts->velocities[3 * vmd_idx + 0] = temp_vels[3 * i + 0] * NM_TO_ANGSTROM;
-                            ts->velocities[3 * vmd_idx + 1] = temp_vels[3 * i + 1] * NM_TO_ANGSTROM;
-                            ts->velocities[3 * vmd_idx + 2] = temp_vels[3 * i + 2] * NM_TO_ANGSTROM;
-                        }
-                    }
-                } else {
-                    for (i = 0; i < h5md->natoms_file; i++) {
-                        ts->velocities[3 * i + 0] = temp_vels[3 * i + 0] * NM_TO_ANGSTROM;
-                        ts->velocities[3 * i + 1] = temp_vels[3 * i + 1] * NM_TO_ANGSTROM;
-                        ts->velocities[3 * i + 2] = temp_vels[3 * i + 2] * NM_TO_ANGSTROM;
-                    }
+                /* Convert (nm/ps -> Angstrom/ps) and copy velocities */
+                for (i = 0; i < h5md->natoms_file; i++) {
+                    ts->velocities[3 * i + 0] = temp_vels[3 * i + 0] * NM_TO_ANGSTROM;
+                    ts->velocities[3 * i + 1] = temp_vels[3 * i + 1] * NM_TO_ANGSTROM;
+                    ts->velocities[3 * i + 2] = temp_vels[3 * i + 2] * NM_TO_ANGSTROM;
                 }
             }
 
@@ -882,13 +927,19 @@ static int read_h5md_gromacs_timestep(void *mydata, int natoms, molfile_timestep
         mem_space = H5Screate_simple(2, box_dims, NULL);
 
         if (H5Dread(h5md->box_dataset, H5T_NATIVE_FLOAT, mem_space, file_space, H5P_DEFAULT, box) >= 0) {
-            /* Extract diagonal (orthogonal box approximation) */
-            ts->A = box[0] * NM_TO_ANGSTROM;  /* [0,0] */
-            ts->B = box[4] * NM_TO_ANGSTROM;  /* [1,1] */
-            ts->C = box[8] * NM_TO_ANGSTROM;  /* [2,2] */
-            ts->alpha = 90.0;
-            ts->beta = 90.0;
-            ts->gamma = 90.0;
+            /* box is a row-major 3x3 matrix whose rows are the cell vectors
+             * a, b, c (GROMACS triclinic convention). Derive VMD's A/B/C lengths
+             * and alpha/beta/gamma angles so non-orthogonal boxes are correct. */
+            double a[3] = { box[0], box[1], box[2] };
+            double b[3] = { box[3], box[4], box[5] };
+            double c[3] = { box[6], box[7], box[8] };
+
+            ts->A = (float)(sqrt(a[0]*a[0] + a[1]*a[1] + a[2]*a[2]) * NM_TO_ANGSTROM);
+            ts->B = (float)(sqrt(b[0]*b[0] + b[1]*b[1] + b[2]*b[2]) * NM_TO_ANGSTROM);
+            ts->C = (float)(sqrt(c[0]*c[0] + c[1]*c[1] + c[2]*c[2]) * NM_TO_ANGSTROM);
+            ts->alpha = (float)vec_angle_deg(b, c);  /* angle between b and c */
+            ts->beta  = (float)vec_angle_deg(a, c);  /* angle between a and c */
+            ts->gamma = (float)vec_angle_deg(a, b);  /* angle between a and b */
         }
 
         H5Sclose(mem_space);
@@ -1008,9 +1059,8 @@ static int read_h5md_gromacs_bonds(void *mydata, int *nbonds, int **fromptr, int
     }
 
     /*
-     * Translate bond indices from file space to VMD space
-     * VMD expects 1-based bond indices, so we add 1 to all indices
-     * If atom selection is active, skip bonds with atoms not in selection
+     * GROMACS stores bonds as 0-based global atom indices; VMD expects 1-based,
+     * so add 1. Skip out-of-range and self-bonds defensively.
      */
     valid_bonds = 0;
     for (i = 0; i < h5md->nbonds; i++) {
@@ -1031,19 +1081,8 @@ static int read_h5md_gromacs_bonds(void *mydata, int *nbonds, int **fromptr, int
             continue;
         }
 
-        /* Translate indices if selection is active */
-        if (h5md->file_to_vmd_index) {
-            vmd_from = h5md->file_to_vmd_index[file_from];
-            vmd_to = h5md->file_to_vmd_index[file_to];
-
-            /* Skip bond if either atom is filtered out */
-            if (vmd_from < 0 || vmd_to < 0) {
-                continue;
-            }
-        } else {
-            vmd_from = file_from;
-            vmd_to = file_to;
-        }
+        vmd_from = file_from;
+        vmd_to = file_to;
 
         /* Store valid bond with 1-based indices (VMD requirement) */
         h5md->bond_from[valid_bonds] = vmd_from + 1;
@@ -1094,7 +1133,6 @@ static void close_h5md_gromacs_read(void *mydata) {
     }
 
     if (h5md->molecule_counts) free(h5md->molecule_counts);
-    if (h5md->file_to_vmd_index) free(h5md->file_to_vmd_index);
 
     /* Free bond data */
     if (h5md->bond_from) free(h5md->bond_from);
@@ -1124,11 +1162,11 @@ VMDPLUGIN_API int VMDPLUGIN_init(void) {
     plugin.type = MOLFILE_PLUGIN_TYPE;
     plugin.name = "h5md_gromacs";
     plugin.prettyname = "GROMACS H5MD";
-    plugin.author = "VMD Plugin Development Team";
+    plugin.author = "Diego E. B. Gomes";
     plugin.majorv = H5MD_GROMACS_VERSION_MAJOR;
     plugin.minorv = H5MD_GROMACS_VERSION_MINOR;
     plugin.is_reentrant = VMDPLUGIN_THREADUNSAFE;  /* HDF5 limitation */
-    plugin.filename_extension = "h5,h5md";
+    plugin.filename_extension = "h5md";
 
     /* Set function pointers */
     plugin.open_file_read = open_h5md_gromacs_read;

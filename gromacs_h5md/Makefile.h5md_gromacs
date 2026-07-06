@@ -50,21 +50,24 @@ else
     $(error Unsupported platform: $(UNAME_S))
 endif
 
-# VMD directories
-VMD_DIR ?= /Applications/VMD.app/Contents/vmd
-VMD_PLUGIN_INCLUDE ?= $(VMD_DIR)/plugins/include
-
-# Try to find VMD automatically
+# VMD directories - platform-specific default (only applied if VMD_DIR is unset).
+# NOTE: $(wildcard) does not match paths containing spaces (macOS .app bundles),
+# so use "$(shell test -d ...)" for existence checks.
 ifeq ($(PLATFORM),macOS)
-    ifeq ($(wildcard $(VMD_DIR)),)
-        VMD_DIR = /Applications/VMD\ 1.9.4a57.app/Contents/vmd
+    VMD_DIR ?= /Applications/VMD.app/Contents/vmd
+    ifeq ($(shell test -d "$(VMD_DIR)" && echo yes),)
+        VMD_DIR = /Applications/VMD 1.9.4a57.app/Contents/vmd
     endif
-    ifeq ($(wildcard $(VMD_DIR)),)
+    ifeq ($(shell test -d "$(VMD_DIR)" && echo yes),)
         $(warning VMD not found at default location. Set VMD_DIR manually.)
     endif
 else
     VMD_DIR ?= /usr/local/lib/vmd
 endif
+
+# Plugin headers live under plugins/include or lib/plugins/include depending on
+# whether VMD_DIR points at a source tree or an installed tree.
+VMD_PLUGIN_INCLUDE ?= $(shell test -d "$(VMD_DIR)/lib/plugins/include" && echo "$(VMD_DIR)/lib/plugins/include" || echo "$(VMD_DIR)/plugins/include")
 
 # HDF5 configuration
 HDF5_PREFIX ?= /opt/homebrew
@@ -89,6 +92,7 @@ CFLAGS += $(HDF5_CFLAGS)
 # Linker flags
 LDFLAGS = $(PLUGIN_LDFLAGS)
 LDFLAGS += $(HDF5_LIBS)
+LDFLAGS += -lm
 
 # Add rpath for runtime library discovery on Linux
 ifeq ($(UNAME_S),Linux)
@@ -127,10 +131,6 @@ install: $(TARGET)
 	@echo ""
 	@echo "To use the plugin in VMD:"
 	@echo "  mol new file.h5md type h5md_gromacs"
-	@echo ""
-	@echo "To enable atom selection:"
-	@echo "  export VMD_H5MD_SELECTION=\"protein\""
-	@echo "  vmd file.h5md"
 
 # Show configuration
 config:
