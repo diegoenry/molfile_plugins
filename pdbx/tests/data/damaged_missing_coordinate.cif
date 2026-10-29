@@ -1,0 +1,18 @@
+data_cg
+# Row 3 lost its z coordinate: no placement fits, so that row is skipped, not shifted.
+loop_
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+1 C BB  ALA A 1 0.0 0.0 0.0
+2 C SC1 ALA A 1 1.0 0.0 0.0
+3 C BB  GLY A 2 2.0 0.0
+4 C BB  LEU A 3 3.0 0.0 0.0
+5 C SC1 LEU A 3 4.0 0.0 0.0
+6 C BB  SER A 4 5.0 0.0 0.0
