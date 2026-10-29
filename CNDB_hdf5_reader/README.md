@@ -20,6 +20,7 @@ CNDB files contain chromatin dynamics data organized as:
 /replica{N}_chr{M}/             - Replica groups (one per chromosome/replica)
   ├── genomic_position          - [natoms, 2] genomic coordinates
   ├── loops                     - [nloops, 2] loop constraint pairs
+  ├── types                     - [natoms] variable-length compartment labels (optional)
   └── spatial_position/         - Trajectory frames
       ├── 1                     - [natoms, 3] coordinates for frame 1
       ├── 2                     - [natoms, 3] coordinates for frame 2
@@ -253,9 +254,15 @@ The plugin:
 
 ### Limitations
 
-- Currently loads the first replica/chromosome found in the file
+- Currently loads the first replica/chromosome found in the file (a note is
+  printed listing how many replicas were skipped)
 - Loop constraints with out-of-bounds indices are skipped
 - Segment ID limited to 7 characters (VMD limitation)
+- A file whose internal HDF5 structures are corrupt (e.g. a damaged global heap
+  behind the `types` dataset) can make the underlying HDF5 library loop while
+  parsing it. This is a limitation of libhdf5 shared by all HDF5 tools, not of
+  this plugin; use `h5check`/`h5dump` to confirm a file is well-formed if a load
+  appears to hang.
 
 ### Multi-Replica Files
 
@@ -271,9 +278,15 @@ For files with multiple replicas (e.g., `replica1_chr10`, `replica2_chr10`), the
 - Verify the file contains replica groups: `h5ls yourfile.cndb`
 - Group names should match pattern: `replica*_chr*`
 
-### Crash on load
-- Check that loop indices are within bounds
-- Verify HDF5 dataset dimensions match expected format
+### Malformed or unexpected file
+As of v0.2 the reader validates every dataset's rank, shape, and datatype and
+checks every HDF5 read before use, so a malformed or corrupt `.cndb` is rejected
+with an error message rather than crashing VMD. If a file fails to load:
+- Confirm `genomic_position` is `[natoms, 2]` and each `spatial_position/<frame>`
+  is `[natoms, 3]` (`h5dump -H yourfile.cndb`)
+- A `types` dataset that is not a `[natoms]` array of variable-length strings is
+  ignored (beads fall back to the generic `BEAD` name)
+- A `loops` dataset that is not `[nloops, 2]` is ignored (no bonds drawn)
 
 ## Development
 
@@ -308,4 +321,8 @@ Diego Enry Barreto Gomes
 
 ## Version
 
-0.1 - Initial release
+- **0.2** - Hardened against malformed and adversarial input: validates every
+  HDF5 dataset rank/shape/datatype and read status, checks all allocations,
+  bounds every count to prevent integer overflow, cleans up completely on all
+  error paths, and emits VMD-correct 1-based bond indices for loop constraints.
+- **0.1** - Initial release
