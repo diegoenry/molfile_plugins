@@ -1,0 +1,21 @@
+data_header_only
+_entry.id HEAD
+_cell.length_a 99.0
+data_first_structure
+_entry.id FIRST
+loop_
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+S SG 1 1 1
+data_second_structure
+loop_
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+C C1 9 9 9
+C C2 8 8 8

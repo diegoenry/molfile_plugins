@@ -1,0 +1,21 @@
+data_models
+# model 2 lacks an atom and is skipped; model 3 matches model 1
+loop_
+_atom_site.group_PDB
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.pdbx_PDB_model_num
+ATOM N N GLY A 1 0.0 0.0 0.0 1
+ATOM C CA GLY A 1 1.0 0.0 0.0 1
+ATOM C C GLY A 1 2.0 0.0 0.0 1
+ATOM N N GLY A 1 0.0 1.0 0.0 2
+ATOM C CA GLY A 1 1.0 1.0 0.0 2
+ATOM N N GLY A 1 0.0 2.0 0.0 3
+ATOM C CA GLY A 1 1.0 2.0 0.0 3
+ATOM C C GLY A 1 2.0 2.0 0.0 3

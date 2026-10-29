@@ -1,0 +1,17 @@
+data_partial_type_symbol
+# One atom has no element symbol. Its type falls back to the atom name "CA",
+# which must not turn into calcium when the structure is written and re-read.
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+ATOM 1 N N  GLY A 1 0.000 0.000 0.000
+ATOM 2 ? CA GLY A 1 1.458 0.000 0.000
+ATOM 3 C C  GLY A 1 2.009 1.420 0.000

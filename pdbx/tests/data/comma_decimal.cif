@@ -1,0 +1,8 @@
+data_comma
+loop_
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+C C1 1,500 -2,250 0,125

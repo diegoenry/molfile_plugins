@@ -1,0 +1,23 @@
+data_oldvmd
+# Written by the old VMD writer with empty chain IDs (2 values missing per row): ambiguous, so nothing is loaded.
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.pdbx_formal_charge
+_atom_site.auth_asym_id
+ATOM 1 C CA . ALA  . 1 ? 10.500000 11.250000 12.125000 1.000000 0.000000 
+ATOM 2 C CA . ALA  . 2 ? 20.500000 21.250000 22.125000 1.000000 0.000000 
+ATOM 3 C CA . ALA  . 3 ? 30.500000 31.250000 32.125000 1.000000 0.000000 
+ATOM 4 C CA . ALA  . 4 ? 40.500000 41.250000 42.125000 1.000000 0.000000 

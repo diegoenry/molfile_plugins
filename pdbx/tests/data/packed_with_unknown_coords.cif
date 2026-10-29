@@ -1,0 +1,13 @@
+data_packed_unknown
+# well-formed: several rows per line, rows wrapped across lines, and one row
+# whose coordinates are unknown ('?'). Must not be "recovered" line by line.
+loop_
+_atom_site.group_PDB
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+ATOM C C1 0 0 0 ATOM C C2 1 0 0 ATOM C
+C3 2 0 0 ATOM C C4 ? ? ? ATOM C C5 4 0 0
+ATOM C C6 5 0 0

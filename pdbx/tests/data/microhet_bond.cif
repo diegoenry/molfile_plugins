@@ -1,0 +1,29 @@
+data_microhet
+# residue 22 is PRO (altloc A) or SER (altloc B); the link names SER, so only
+# the SER conformer's CA may be bonded
+loop_
+_struct_conn.conn_type_id
+_struct_conn.ptnr1_label_comp_id
+_struct_conn.ptnr1_label_atom_id
+_struct_conn.ptnr1_auth_asym_id
+_struct_conn.ptnr1_auth_seq_id
+_struct_conn.ptnr2_label_comp_id
+_struct_conn.ptnr2_label_atom_id
+_struct_conn.ptnr2_auth_asym_id
+_struct_conn.ptnr2_auth_seq_id
+covale SER CA A 22 LIG C1 A 101
+#
+loop_
+_atom_site.group_PDB
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_seq_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+ATOM   C CA A PRO A 22 0 0 0
+ATOM   C CA B SER A 22 0 1 0
+HETATM C C1 . LIG A 101 1 0 0

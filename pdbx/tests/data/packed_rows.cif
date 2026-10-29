@@ -1,0 +1,10 @@
+data_packed
+loop_
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+C C1 0 0 0 C C2 1 0 0 C C3 2 0 0
+O O1 3 0
+0 N N1 4 0 0

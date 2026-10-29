@@ -1,0 +1,18 @@
+data_one
+_atom_site.group_PDB   HETATM
+_atom_site.id          1
+_atom_site.type_symbol NA
+_atom_site.label_atom_id NA
+_atom_site.label_comp_id NA
+_atom_site.auth_asym_id  B
+_atom_site.auth_seq_id   101
+_atom_site.Cartn_x  -1.250
+_atom_site.Cartn_y   0.500
+_atom_site.Cartn_z  12.000
+_atom_site.pdbx_formal_charge 1
+_cell.length_a 10.0
+_cell.length_b 20.0
+_cell.length_c 30.0
+_cell.angle_alpha 90
+_cell.angle_beta 100
+_cell.angle_gamma 90

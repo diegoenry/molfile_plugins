@@ -1,0 +1,18 @@
+data_ihm_start
+loop_
+_ihm_starting_model_coord.starting_model_id
+_ihm_starting_model_coord.group_PDB
+_ihm_starting_model_coord.id
+_ihm_starting_model_coord.type_symbol
+_ihm_starting_model_coord.atom_id
+_ihm_starting_model_coord.comp_id
+_ihm_starting_model_coord.entity_id
+_ihm_starting_model_coord.asym_id
+_ihm_starting_model_coord.seq_id
+_ihm_starting_model_coord.Cartn_x
+_ihm_starting_model_coord.Cartn_y
+_ihm_starting_model_coord.Cartn_z
+_ihm_starting_model_coord.B_iso_or_equiv
+_ihm_starting_model_coord.ordinal_id
+A-m1 ATOM 1 N N SER 1 A 7 -8.1 5.5 9.2 . 1
+A-m1 ATOM 2 C CA SER 1 A 7 -7.1 6.5 9.2 . 2
