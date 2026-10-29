@@ -8,13 +8,18 @@
  * to be within [1, natoms].
  *
  * Usage:
- *   pdbx_dump [-q] [-c] [-a N] [-w out.cif] file.cif
+ *   pdbx_dump [-q] [-c] [-l] [-z] [-Z N] [-a N] [-b N] [-w out.cif] file.cif
  *     -q         summary line only
  *     -c         machine-comparable dump of every atom and frame (no type field,
  *                which the writer normalizes to the element symbol)
  *     -a N       print the first N atoms (default 10, -1 = all)
  *     -w FILE    write the structure and all frames back out with the plugin
  *     -b N       start with an N-byte read buffer (tests refills at every token)
+ *     -z         never rewind compressed input (as if the re-read budget were spent)
+ *     -Z N       allow exactly N bytes of compressed input to be decompressed again
+ *     -l         list the registered plugins and exit
+ *
+ * The file name may carry the plugin's options, e.g. "file.cif?chain=A,B".
  *
  * Exit status: 0 ok, 1 open/read failure, 2 consistency error.
  */
@@ -27,15 +32,17 @@
 #include <cstring>
 #include <vector>
 
-static molfile_plugin_t *g_plugin = NULL;
+static molfile_plugin_t *g_plugin = NULL;     /* the first one: "pdbx" */
+static std::vector<molfile_plugin_t *> g_all;
 
 static int register_cb(void *, vmdplugin_t *p) {
-  g_plugin = (molfile_plugin_t *)p;
+  g_all.push_back((molfile_plugin_t *)p);
+  if (!g_plugin) g_plugin = (molfile_plugin_t *)p;
   return VMDPLUGIN_SUCCESS;
 }
 
 int main(int argc, char **argv) {
-  bool quiet = false, compare = false;
+  bool quiet = false, compare = false, list = false;
   long show = 10;
   const char *out = NULL;
   const char *in = NULL;
@@ -45,16 +52,31 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "-a") && i + 1 < argc) show = atol(argv[++i]);
     else if (!strcmp(argv[i], "-w") && i + 1 < argc) out = argv[++i];
     else if (!strcmp(argv[i], "-b") && i + 1 < argc) g_read_buffer_bytes = (size_t)atol(argv[++i]);
+    else if (!strcmp(argv[i], "-z")) g_gz_rewind_factor = g_gz_rewind_extra = 0;
+    else if (!strcmp(argv[i], "-Z") && i + 1 < argc) {
+      g_gz_rewind_factor = 0;
+      g_gz_rewind_extra = atoll(argv[++i]);
+    }
+    else if (!strcmp(argv[i], "-l")) list = true;
     else in = argv[i];
-  }
-  if (!in) {
-    fprintf(stderr, "usage: %s [-q] [-a N] [-w out.cif] file.cif\n", argv[0]);
-    return 1;
   }
 
   VMDPLUGIN_init();
   VMDPLUGIN_register(NULL, register_cb);
   if (!g_plugin) return 1;
+  if (list) {
+    for (size_t k = 0; k < g_all.size(); k++)
+      printf("PLUGIN %s %d.%d %s %s reader=%s writer=%s\n", g_all[k]->name,
+             g_all[k]->majorv, g_all[k]->minorv, g_all[k]->filename_extension,
+             g_all[k]->type, g_all[k]->open_file_read ? "yes" : "no",
+             g_all[k]->open_file_write ? "yes" : "no");
+    return 0;
+  }
+  if (!in) {
+    fprintf(stderr, "usage: %s [-q] [-c] [-l] [-z] [-Z N] [-a N] [-b N] [-w out.cif] file.cif\n",
+            argv[0]);
+    return 1;
+  }
 
   int natoms = -2;
   void *h = g_plugin->open_file_read(in, "pdbx", &natoms);

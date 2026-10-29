@@ -8,7 +8,13 @@
  * the atom count, the frames, and every field the writer stores losslessly.
  * Each input is also read a second time with a read buffer of a few bytes,
  * so that every token straddles buffer refills; both readings must agree
- * exactly. A violation aborts, so libFuzzer saves the input as a crash.
+ * exactly. With zlib, the input is also gzip-compressed and read from the
+ * .gz file (again with a tiny buffer, so damaged loops rewind the compressed
+ * stream), which must give the same result. Finally the chain of one atom is
+ * selected with "?chain=ID" (ID as segname shows it): that load must hold
+ * exactly the atoms with that segname from the full load, in order, with the
+ * same first-frame coordinates.
+ * A violation aborts, so libFuzzer saves the input as a crash.
  *
  * Build and run:  make fuzz   (needs clang with libFuzzer, e.g. Homebrew llvm)
  */
@@ -26,11 +32,11 @@
 
 namespace {
 
-molfile_plugin_t *g_plugin = NULL;
-std::string g_in, g_out;
+molfile_plugin_t *g_plugin = NULL;     /* the first one registered: "pdbx" */
+std::string g_in, g_out, g_gz;
 
 int register_cb(void *, vmdplugin_t *p) {
-  g_plugin = (molfile_plugin_t *)p;
+  if (!g_plugin) g_plugin = (molfile_plugin_t *)p;
   return VMDPLUGIN_SUCCESS;
 }
 
@@ -186,6 +192,68 @@ void same(const Loaded &A, const Loaded &B) {
     fail("buffer size changed graphics");
 }
 
+#ifdef _USE_ZLIB
+/* gzip-compress data into path, in two members when split > 0 */
+bool write_gzip(const std::string &path, const uint8_t *data, size_t size, size_t split) {
+  FILE *fp = fopen(path.c_str(), "wb");
+  if (!fp) return false;
+  bool ok = true;
+  size_t parts[2] = { split < size ? split : size, 0 };
+  parts[1] = size - parts[0];
+  for (int m = 0; m < 2 && ok; m++) {
+    if (m == 1 && parts[1] == 0) break;
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    if (deflateInit2(&zs, 6, Z_DEFLATED, 31, 8, Z_DEFAULT_STRATEGY) != Z_OK) { ok = false; break; }
+    zs.next_in = (Bytef *)(data + (m ? parts[0] : 0));
+    zs.avail_in = (uInt)parts[m];
+    unsigned char out[4096];
+    int r;
+    do {
+      zs.next_out = out;
+      zs.avail_out = sizeof(out);
+      r = deflate(&zs, Z_FINISH);
+      size_t n = sizeof(out) - zs.avail_out;
+      if (n && fwrite(out, 1, n, fp) != n) ok = false;
+    } while (r == Z_OK && ok);
+    if (r != Z_STREAM_END) ok = false;
+    deflateEnd(&zs);
+  }
+  if (fclose(fp) != 0) ok = false;
+  return ok;
+}
+#endif
+
+/* "?chain=ID" on the chain of one atom: exactly that chain's atoms of A */
+void check_selection(const Loaded &A, size_t pick) {
+  if (A.natoms == 0) return;
+  const molfile_atom_t &a0 = A.atoms[pick % (size_t)A.natoms];
+  std::string id(a0.segid, strnlen(a0.segid, sizeof(a0.segid)));
+  /* a truncated (7-character) segname selects every chain it stands for,
+   * which is exactly the atoms showing that segname */
+  if (id.empty()) return;
+  for (size_t i = 0; i < id.size(); i++) {
+    unsigned char c = (unsigned char)id[i];
+    if (c <= 32 || c >= 127 || c == ',' || c == '?' || c == '&') return;
+  }
+  std::vector<size_t> want;
+  for (size_t i = 0; i < A.atoms.size(); i++)
+    if (strncmp(A.atoms[i].segid, id.c_str(), sizeof(a0.segid)) == 0) want.push_back(i);
+
+  Loaded F;
+  if (!load((g_in + "?chain=" + id).c_str(), F)) fail("chain selection: load failed");
+  if ((size_t)F.natoms != want.size()) fail("chain selection: wrong atom count");
+  for (size_t k = 0; k < want.size(); k++) {
+    if (memcmp(&F.atoms[k], &A.atoms[want[k]], sizeof(molfile_atom_t)) != 0)
+      fail("chain selection: atom differs", (long)k);
+    for (int c = 0; c < 3; c++)
+      if (F.frames[0][3 * k + c] != A.frames[0][3 * want[k] + c])
+        fail("chain selection: coordinate differs", (long)k);
+  }
+  if (F.frames.size() < A.frames.size()) fail("chain selection: fewer frames");
+  if (memcmp(F.cell, A.cell, sizeof(A.cell))) fail("chain selection: cell differs");
+}
+
 }  // namespace
 
 extern "C" int LLVMFuzzerInitialize(int *, char ***) {
@@ -198,6 +266,7 @@ extern "C" int LLVMFuzzerInitialize(int *, char ***) {
   snprintf(pid, sizeof(pid), "%ld", (long)getpid());
   g_in = dir + "pdbx_fuzz_in_" + pid + ".cif";
   g_out = dir + "pdbx_fuzz_out_" + pid + ".cif";
+  g_gz = dir + "pdbx_fuzz_in_" + pid + ".cif.gz";
   if (!freopen("/dev/null", "w", stdout)) return 0;   /* plugin messages */
   return 0;
 }
@@ -215,6 +284,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   g_read_buffer_bytes = (size_t)1 << 16;
   if (ok != ok_tiny) fail("buffer size changed whether the file loads");
   if (ok) same(A, T);
+#ifdef _USE_ZLIB
+  /* input that is itself gzip data would be compressed twice */
+  if (!(size >= 2 && data[0] == 0x1f && data[1] == 0x8b) &&
+      write_gzip(g_gz, data, size, size ? data[size / 3] * size / 256 : 0)) {
+    Loaded Z;
+    g_read_buffer_bytes = 1 + (size ? data[size / 4] % 7 : 0);
+    bool ok_gz = load(g_gz.c_str(), Z);
+    g_read_buffer_bytes = (size_t)1 << 16;
+    if (ok != ok_gz) fail("gzip changed whether the file loads");
+    if (ok) same(A, Z);
+  }
+#endif
+  if (ok && A.natoms > 0) check_selection(A, size ? data[size - 1] : 0);
   if (ok && A.natoms > 0) roundtrip(A);
   return 0;
 }

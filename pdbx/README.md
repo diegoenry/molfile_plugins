@@ -1,8 +1,12 @@
-# pdbx — PDBx/mmCIF reader and writer for VMD (v1.0)
+# pdbx — PDBx/mmCIF reader and writer for VMD (v2.0)
 
-A from-scratch rewrite of VMD's `pdbx` molfile plugin. It registers under the
-same name (`pdbx`) with a higher version than the built-in plugin (0.14), so VMD
-uses it automatically for `.cif` files once it is loaded.
+A from-scratch rewrite of VMD's `pdbx` molfile plugin, and the only mmCIF
+plugin in this repository: the separate `mmcif` reader that used to live in
+`../mmcif` is merged into it. It registers as `pdbx` (files ending in `.cif`
+or `.mmcif`) and also as `mmcif`, so scripts that say `type mmcif` keep
+working. Both names have a higher version than the plugins they replace
+(built-in pdbx 0.14, mmcif 1.x), so VMD uses this one once it is loaded, even
+if an old `mmcifplugin.so` is still installed.
 
 ## Why
 
@@ -22,7 +26,7 @@ ordinary entries such as 4hhb, 1hzh and 6vxx.
 
 ## What it does now
 
-| | old pdbx 0.14 | new pdbx 1.0 |
+| | old pdbx 0.14 | new pdbx 2.0 |
 |---|---|---|
 | Unknown element symbol | whole load aborted | atom loads as element `X`; symbol kept in `type` |
 | Revised PDB entries (4hhb, 1hzh, 6vxx, ...) | fail | load |
@@ -36,35 +40,97 @@ ordinary entries such as 4hhb, 1hzh and 6vxx.
 | Rows with missing or extra values | everything after them shifts | each damaged row is matched to its columns by value type, or skipped if that is ambiguous, with a warning |
 | Chemical component files (e.g. `ATP.cif`) | fail | load with all bonds and bond orders |
 | Writer | malformed output for empty fields or names with spaces | valid, quoted, locale-independent mmCIF, one model per frame |
+| `.cif.gz` (as the PDB distributes files) | not read | read and written directly (when built with zlib) |
+| Loading only some chains | no | `file.cif?chain=A,B` or `MMCIF_CHAIN` |
 
 For 1crn, 4hhb, 1d3z, 1ejg, 1hzh, 1bna, 2n9k and 6vxx, every atom field VMD
 exposes matches what VMD's own PDB reader gives for the `.pdb` version of the
 same entry: name, resname, resid, chain, insertion, altloc, element,
 occupancy, beta, and coordinates in every frame.
 
+### For users of the former `mmcif` plugin
+
+Everything it did is here: unknown elements, the unit cell, `_struct_conn`
+bonds, NMR models as frames, and the chain selection (`?chain=A,B`,
+`MMCIF_CHAIN`). Some results differ, because they now match VMD's PDB reader:
+
+| | mmcif 1.x | this plugin |
+|---|---|---|
+| Alternate locations | only the first (`A`) was kept | all are kept, as in a PDB file (select with `altloc "" A`) |
+| `segname` | `label_asym_id` | the full author chain ID (`AA`, `A-2`, ...) |
+| `type` | the atom name | the element symbol from the file (keeps bead types such as `Cg`) |
+| Mass of an unknown element | 0 | guessed by VMD from the atom name |
+| A model with different atoms | ended the trajectory | is skipped; later matching models still load |
+| Rows with missing or extra values | the rest of the table shifted | repaired or skipped (see Damaged rows) |
+| Bonds to symmetry copies | added between the wrong atoms | skipped |
+| Several data blocks, IHM files, ligand files | not read | read |
+| Writing | no | yes |
+
 ## Build and load
 
 ```sh
-make                 # builds pdbxplugin.so (auto-detects the VMD headers)
-make config          # shows the detected paths
+make                 # builds pdbxplugin.so (auto-detects the VMD headers and zlib)
+make config          # shows the detected paths and whether zlib is used
 make VMD_PLUGIN_INCLUDE=/path/to/vmd/plugins/include   # if detection fails
+make ZLIB=0          # without zlib: .cif.gz files are then refused with a message
 ```
 
 Load it for one session (or put the line in `~/.vmdrc`):
 
 ```tcl
 plugin dlopen /path/to/pdbxplugin.so
-mol new myfile.cif            ;# picked by extension, or: type pdbx
+mol new myfile.cif                    ;# picked by extension, or: type pdbx
+mol new 1abc.cif.gz type pdbx         ;# VMD only looks at the last extension (.gz)
+mol new "myfile.cif?chain=A,B" type pdbx
+animate write pdbx out.cif.gz         ;# a name ending in .gz is written compressed
 ```
 
 To make it permanent, `make install` copies it into VMD's molfile plugin
 directory. VMD prefers the higher version number, so it shadows the built-in
 plugin without removing it. To check which one is active:
-`plugin info "mol file reader" pdbx p; parray p` shows version 1.0.
+`plugin info "mol file reader" pdbx p; parray p` shows version 2.0.
 
 For a static VMD build, copy `pdbxplugin.C` over
 `plugins/molfile_plugin/src/pdbxplugin.C`. It is a single C++11 file with no
-dependencies beyond the molfile headers.
+dependencies beyond the molfile headers. For `.cif.gz` support, compile it
+with `-D_USE_ZLIB` and link `-lz`, as VMD's LAMMPS and VTF plugins do.
+
+## Loading only some chains
+
+Put the chain IDs after a `?` at the end of the file name, or set
+`MMCIF_CHAIN` (the file name wins when both are given):
+
+```tcl
+mol new "4v6x.cif?chain=A,B" type pdbx    ;# or "?chain=A B"
+set env(MMCIF_CHAIN) "AA,A-2"; mol new big.cif
+```
+
+- IDs are chain IDs as in `segname` (`auth_asym_id`, or `label_asym_id`
+  with `VMDPDBXUSELABELIDS`). They are case-sensitive: `a` and `A` are
+  different chains in large assemblies. A chain ID longer than `segname`
+  holds (7 characters) is selected by its full ID or by the 7 characters
+  VMD shows, which selects every chain that shares them.
+- The result is exactly the selected atoms of the full load. The first model
+  still defines the structure; a later model becomes a frame if it matches on
+  the selected chains (so a model that differs only in another chain is a
+  frame).
+- Bonds to chains that were not loaded are skipped, with a note; other bond
+  records that match no loaded atom are reported as unmatched, as without a
+  selection. IHM spheres are selected by their `asym_id`. Chemical component
+  files have no chains; the selection is ignored with a note.
+- A selected chain without atoms (not in the file, or without usable
+  coordinates) is reported; if no atom is selected, the load fails and lists
+  the chains that have atoms.
+- A file whose name really contains `?` is opened as named, and a `?` in a
+  directory name is part of the path. Any other option after `?` is an error
+  rather than being ignored. IDs are separated by commas or blanks, and `&`
+  starts another option, so an ID containing `&` or `?` can be selected only
+  with `MMCIF_CHAIN`.
+- `MMCIF_CHAIN` applies to every load until it is unset; each filtered load
+  says so in the console.
+- The whole file is still read (the chain is in every row), but only the
+  selected atoms are kept, so memory drops: 3j3q with two of its 1,356
+  chains needs about 50 MB instead of 590 MB.
 
 ## Field mapping (`_atom_site`)
 
@@ -116,6 +182,16 @@ Notes:
 - **Label numbering.** Set `VMDPDBXUSELABELIDS=1` before loading to get
   `label_asym_id` / `label_seq_id` instead. In this mode, waters and ligands
   (which have no `label_seq_id`) fall back to `auth_seq_id`.
+- **Compressed files.** gzip data is recognized by its content, not the
+  file name, and decompressed while it is read, so memory use is the same as
+  for the plain file (3j3q.cif.gz loads in 2.2 s, about 0.1 s more). Concatenated
+  `.gz` files work, and zero padding after the data is ignored. A truncated
+  or damaged file, or other bytes after the data (usually a damaged second
+  part), fails with a message saying so rather than loading part of the
+  file. Re-reading a damaged table means decompressing again from the
+  start, so that work is capped (a few times the file size). The table is
+  re-read only if the plugin can also go back to its normal reading; past
+  the cap, as for a pipe, it keeps the normal reading.
 - **IHM.** `_ihm_starting_model_coord` is read when there is no `_atom_site`,
   and `_ihm_sphere_obj_site` spheres of the first model become VMD graphics,
   as in the original plugin. For coarse-grained spheres as real atoms, use
@@ -137,9 +213,12 @@ Notes:
   CIF 1.1: characters it does not allow (control characters, non-ASCII
   bytes) are written as `_`, and a value that neither quote style can hold is
   written as a text field.
-- No gzip support (decompress `.cif.gz` first). Compressed files (gzip,
-  bzip2, xz, zstd, zip) and BinaryCIF are recognized and rejected with a
+- gzip is the only compression read (without zlib, not even that). bzip2,
+  xz, zstd, zip and BinaryCIF (`.bcif`) are recognized and rejected with a
   message that says so.
+- VMD picks a plugin by the last extension only, so `.cif.gz` needs
+  `type pdbx`. The plugin does not claim `.gz` itself, since that would
+  route every compressed format to it.
 - A single value larger than 256 MiB stops the load with an error. Only an
   unterminated text field can produce one; real values are a few MB at most.
 - At most 1,000,000 models per file are considered for frames; rows of
@@ -148,10 +227,12 @@ Notes:
 ## Tests
 
 ```sh
-make test     # 28 fixtures in tests/data: summary lines vs tests/expected.txt (also
-              # with 1-7 byte read buffers), write/read round trip, error paths
+make test     # 30 fixtures in tests/data: summary lines vs tests/expected.txt (also
+              # with 1-7 byte read buffers), write/read round trip, error paths,
+              # chain selection, .gz reading and writing
 make asan     # the same driver built with AddressSanitizer + UBSan
 make fuzz     # coverage-guided fuzzing (libFuzzer); FUZZ_TIME=300 seconds, FUZZ_JOBS=4
+make ZLIB=0 test   # the build without zlib
 ```
 
 - `tests/pdbx_dump.cpp` is a standalone driver that runs the plugin the way
@@ -159,22 +240,35 @@ make fuzz     # coverage-guided fuzzing (libFuzzer); FUZZ_TIME=300 seconds, FUZZ
   catches any overrun, and it checks that bond indices are in range.
   `-a N` prints atoms, `-w out.cif` writes the file back out, and `-b N`
   starts with an N-byte read buffer so every token straddles a refill.
+  `-z` forbids rewinding compressed input, and `-l` lists the registered
+  plugin names. File names may carry options (`file.cif?chain=A`).
 - `tests/roundtrip.sh` reads a file, writes it, reads it again, and compares
   every atom and frame.
 - `tests/messages.sh` checks the error paths: compressed input, a read error
   (a directory), a named pipe (no rewinding possible), and that control
   characters from the file never reach the console.
+- `tests/options.sh` checks the chain selection (file name, `MMCIF_CHAIN`,
+  label numbering, long IDs, missing chains, bad options, bond messages),
+  that every fixture reads the same from a `.gz` (also with tiny buffers),
+  that any rewind budget gives either the plain or the normal reading,
+  truncated, damaged, concatenated, padded and nested `.gz` files, `.gz`
+  from a pipe, writing `.cif.gz`, and that both plugin names are registered.
+  The test scripts unset `MMCIF_CHAIN` and `VMDPDBXUSELABELIDS` first.
 - `tests/fuzz_pdbx.cpp` is a libFuzzer target. Each input is read twice, with
   the normal buffer and with one of a few bytes, and both readings must agree
   exactly. Every input that loads is also written and read back, and the
   round trip must keep the atom count, frames, coordinates and every field
-  the writer stores losslessly. It needs a clang
+  the writer stores losslessly. Each input is also gzip-compressed (sometimes
+  in two members) and must read the same from the `.gz`, and the chain of
+  one atom is selected with `?chain=`: that load must hold exactly that
+  chain's atoms of the full load. It needs a clang
   that ships libFuzzer (Homebrew `llvm`; Apple's clang does not). Corpus and
   crash files go to `$TMPDIR/pdbx_fuzz`.
 - `tests/compare_with_pdb.tcl` runs in VMD and compares `ID.cif` (this plugin)
   against `ID.pdb` (VMD's PDB reader), field by field.
 - `tests/vmd_checks.tcl` runs end-to-end checks inside VMD: unknown elements,
-  frames, writing, bonds, IHM graphics, label numbering.
+  frames, writing, bonds, IHM graphics, label numbering, the `mmcif` name,
+  chain selection, and reading and writing `.cif.gz`.
 
 ```sh
 vmd -dispdev text -e tests/vmd_checks.tcl -args $PWD/pdbxplugin.so $PWD/tests/data
@@ -220,12 +314,14 @@ vmd -dispdev text -e tests/vmd_checks.tcl -args \
     $PWD/pdbxplugin.so $PWD/tests/data ~/pdbx_test/ATP.cif
 ```
 
-Verified on 11 PDB entries (up to the 2.4-million-atom 3j3q), the 28 fixtures,
-a 3,300-file mutation corpus, and about 1.8 million coverage-guided fuzzing
-runs, all under AddressSanitizer/UBSan. There were no sanitizer reports,
-crashes or hangs. gemmi reads the writer's output exactly as this plugin
-does, including hostile names. Loading 3j3q in VMD takes about the same time
-and memory as the original plugin (2.9 s, 1.0 GB).
+Verified on 11 PDB entries (up to the 2.4-million-atom 3j3q), the 30 fixtures,
+a 3,300-file mutation corpus, and about 2.4 million coverage-guided fuzzing
+runs under AddressSanitizer/UBSan, the last 230,000 of them on the final code
+with the gzip and chain-selection checks, with no sanitizer reports, crashes
+or hangs. gemmi reads the writer's output, plain and `.gz`, exactly as this
+plugin does, including hostile names. Loading 3j3q in VMD takes about the
+same time and memory as the original plugin (2.9 s, 1.0 GB), and reading
+3J3Q.cif.gz as the PDB distributes it takes the same as the plain file.
 
 Author: Diego Enry Barreto Gomes. University of Illinois Open Source License
 (see the repository README).
