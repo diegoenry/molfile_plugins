@@ -205,7 +205,8 @@ Notes:
   instead of 1.04 GB) but is as fast (3.2 s; the file is 29 MB instead of
   241 MB). Damaged files fail with a message naming the column and the
   problem; every size and offset is checked, and a file cannot claim far
-  more values than its size allows. All seven encodings of the format are
+  more values, or expand to far more text, than its size allows (a string
+  repeated in millions of rows, say). All seven encodings of the format are
   read (ByteArray, FixedPoint, IntervalQuantization, RunLength, Delta,
   IntegerPacking, StringArray).
 - **IHM.** `_ihm_starting_model_coord` is read when there is no `_atom_site`,

@@ -1871,7 +1871,18 @@ class BcifDecoder {
  public:
   BcifDecoder(const MpDoc &d, size_t file_bytes)
     : d_(d), spent_(0),
-      budget_((long long)64 * (long long)file_bytes + ((long long)16 << 20)) {}
+      budget_((long long)64 * (long long)file_bytes + ((long long)16 << 20)),
+      emitted_(0),
+      emit_budget_((long long)64 * (long long)file_bytes + ((long long)64 << 20)) {}
+
+  /* Bytes of text given to the sinks, capped like the decoded values: an
+   * index column can repeat a long string in every row, and a category can
+   * claim many rows, so the text is not bounded by the file otherwise. */
+  void emit(unsigned long long bytes) {
+    if (bytes > (unsigned long long)emit_budget_ ||
+        (emitted_ += (long long)bytes) > emit_budget_)
+      bcif_fail("the decoded text is implausibly large for the file size");
+  }
 
   /* Decode {data, encoding} into exactly `len` values. */
   BcifArray column(const MpVal &enc_data, size_t len, const std::string &what) {
@@ -1891,6 +1902,8 @@ class BcifDecoder {
   const MpDoc &d_;
   long long spent_;
   const long long budget_;
+  long long emitted_;
+  const long long emit_budget_;
   std::string what_;
 
   void fail(const std::string &why) const { bcif_fail(what_ + ": " + why); }
@@ -2155,6 +2168,7 @@ class BcifDecoder {
       if (b0 < 0 || b1 < b0 || (size_t)b1 > nchars) fail("a string offset is out of range");
       const size_t s0 = ascii ? (size_t)b0 : byte_at[(size_t)b0];
       const size_t s1 = ascii ? (size_t)b1 : byte_at[(size_t)b1];
+      if (s1 - s0 > kMaxTokenBytes) fail("a string is larger than 256 MiB");
       a.sp[k] = sd->p + s0;
       a.sn[k] = s1 - s0;
     }
@@ -2338,6 +2352,9 @@ class Parser {
       }
     }
 
+    /* every row and value costs at least a byte, charged before any row is
+     * fed, so a huge row count fails at once (also with no columns used) */
+    dec.emit((unsigned long long)nrows * (use.size() + 1));
     looped_.insert(cname);
     std::vector<std::string> items(use.size());
     for (size_t k = 0; k < use.size(); k++) items[k] = use[k].item;
@@ -2353,14 +2370,17 @@ class Parser {
         const BcifArray &a = col.values;
         if (a.kind == BcifArray::STRINGS) {
           const int32_t ix = a.ints[r];
-          if (ix < 0) s->value(k, "", 0, false);            /* no string: "" */
-          else s->value(k, a.sp[(size_t)ix], a.sn[(size_t)ix], false);
+          if (ix < 0) { s->value(k, "", 0, false); continue; }   /* no string: "" */
+          dec.emit(a.sn[(size_t)ix]);
+          s->value(k, a.sp[(size_t)ix], a.sn[(size_t)ix], false);
         } else if (a.kind == BcifArray::REALS) {
           if (!std::isfinite(a.reals[r])) { s->value(k, "?", 1, true); continue; }
           size_t n = format_real(a.reals[r], a.single, buf);
+          dec.emit(n);
           s->value(k, buf, n, n == 0);
         } else {
           size_t n = format_fixed(a.ints[r], a.decimals > 0 ? a.decimals : 0, buf);
+          dec.emit(n);
           s->value(k, buf, n, false);
         }
       }

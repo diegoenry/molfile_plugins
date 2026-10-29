@@ -349,6 +349,19 @@ def bad_files(doc, packed):
     cols = atom_site_of(d)["columns"]
     cols.insert(0, cols.pop(cols.index(c)))
     add("bad_bomb", msgpack.packb(d), "implausibly large for the file size")
+    # one 64 KB string repeated in 4 million rows: tiny to decode, 256 GB of text
+    d = copy.deepcopy(doc)
+    big = "x" * (1 << 16)
+    idata, ienc = int_chain([0] * (1 << 22), ["rle", "bytes:3"])
+    odata, oenc = int_chain([0, len(big)], ["bytes:3"])
+    d["dataBlocks"][1]["categories"].append({"name": "_struct_conn", "rowCount": 1 << 22, "columns": [
+        column("conn_type_id", idata, [{"kind": "StringArray", "dataEncoding": ienc, "stringData": big,
+                                        "offsetEncoding": oenc, "offsets": odata}])]})
+    add("bad_strings", msgpack.packb(d), "decoded text is implausibly large")
+    # many rows and no column the plugin uses
+    d = copy.deepcopy(doc)
+    d["dataBlocks"][1]["categories"].append({"name": "_struct_conn", "rowCount": 1 << 28, "columns": []})
+    add("bad_rows", msgpack.packb(d), "decoded text is implausibly large")
     return bad
 
 

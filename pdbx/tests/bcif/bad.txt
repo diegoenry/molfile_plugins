@@ -12,3 +12,5 @@ bad_noblocks.bcif|no list of data blocks
 bad_nesting.bcif|nested too deeply
 bad_ext.bcif|unsupported MessagePack type
 bad_bomb.bcif|implausibly large for the file size
+bad_strings.bcif|decoded text is implausibly large
+bad_rows.bcif|decoded text is implausibly large
