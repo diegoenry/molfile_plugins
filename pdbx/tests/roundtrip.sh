@@ -5,6 +5,7 @@
 # usage: tests/roundtrip.sh DRIVER file.cif [file.cif ...]
 # DRIVER is tests/pdbx_dump or tests/pdbx_dump_asan.
 
+unset MMCIF_CHAIN VMDPDBXUSELABELIDS    # must not leak in from the caller
 driver=$1
 shift
 tmp=${TMPDIR:-/tmp}/pdbx_roundtrip.$$

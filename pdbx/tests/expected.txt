@@ -1,6 +1,8 @@
 tests/data/altloc_bonds.cif RESULT ok natoms=10 frames=1 bonds=4 orders=no graphics=0 flags=0x1c2 elementX=0 coordsum=34.000
 tests/data/ambiguous_label_bond.cif RESULT ok natoms=4 frames=1 bonds=0 orders=no graphics=0 flags=0x80 elementX=0 coordsum=49.100
+tests/data/chains.cif RESULT ok natoms=10 frames=1 bonds=3 orders=no graphics=0 flags=0x180 elementX=0 coordsum=61.000
 tests/data/charges_isotopes.cif RESULT ok natoms=8 frames=1 bonds=0 orders=no graphics=0 flags=0x90 elementX=3 coordsum=28.000
+tests/data/chem_comp.cif RESULT ok natoms=4 frames=1 bonds=3 orders=yes graphics=0 flags=0x92 elementX=0 coordsum=0.130
 tests/data/comma_decimal.cif RESULT ok natoms=1 frames=1 bonds=0 orders=no graphics=0 flags=0x80 elementX=0 coordsum=-0.625
 tests/data/crlf_bom.cif RESULT ok natoms=2 frames=1 bonds=0 orders=no graphics=0 flags=0x80 elementX=0 coordsum=24.000
 tests/data/damaged_every_row.cif RESULT open-failed

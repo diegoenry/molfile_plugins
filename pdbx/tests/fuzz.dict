@@ -1,5 +1,5 @@
-# libFuzzer dictionary for tests/fuzz_pdbx.cpp: CIF syntax and the mmCIF
-# items the plugin reads
+# libFuzzer dictionary for tests/fuzz_pdbx.cpp: CIF syntax, the mmCIF
+# items the plugin reads, and gzip headers
 "data_"
 "loop_"
 "save_"
@@ -73,3 +73,5 @@
 "arom"
 "Fe2+"
 "Cg"
+"\x1f\x8b\x08\x00"
+"\x1f\x8b\x08\x08"

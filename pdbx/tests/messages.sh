@@ -4,6 +4,7 @@
 #
 # usage: tests/messages.sh DRIVER
 
+unset MMCIF_CHAIN VMDPDBXUSELABELIDS    # must not leak in from the caller
 driver=$1
 tmp=${TMPDIR:-/tmp}/pdbx_messages.$$
 mkdir -p "$tmp" || exit 1
@@ -21,9 +22,10 @@ expect() {          # expect NAME PATTERN FILE
     fi
 }
 
-# compressed input is named, not reported as "no coordinates"
-gzip -c tests/data/models.cif > "$tmp/models.cif"
-expect "gzip input" "is gzip-compressed" "$tmp/models.cif"
+# a compression format that is not read is named, not reported as "no
+# coordinates" (gzip is read; see options.sh)
+printf 'BZh91AY&SY\001\002\003\004' > "$tmp/models.cif"
+expect "bzip2 input" "is bzip2-compressed" "$tmp/models.cif"
 
 # a read error is an error, not an empty file
 expect "directory as input" "read error" "$tmp"
@@ -33,8 +35,9 @@ expect "directory as input" "read error" "$tmp"
 if command -v mkfifo > /dev/null; then
     mkfifo "$tmp/fifo.cif"
     cat tests/data/nonstandard_elements.cif > "$tmp/fifo.cif" &
+    writer=$!
     expect "named pipe" "RESULT ok" "$tmp/fifo.cif"
-    wait
+    kill $writer 2>/dev/null; wait $writer 2>/dev/null    # if nothing read the pipe
 fi
 
 # control characters from the file never reach the console

@@ -1,10 +1,12 @@
 /*
  * pdbxplugin.C -- PDBx/mmCIF reader and writer plugin for VMD
  *
- * A rewrite of VMD's "pdbx" molfile plugin. It registers under the same
- * plugin name ("pdbx") with a higher version number, so VMD picks it over the
- * built-in plugin when both are available. No code is shared with the
- * original implementation.
+ * A rewrite of VMD's "pdbx" molfile plugin, and the single mmCIF plugin of
+ * this repository: it also replaces the separate "mmcif" reader. It registers
+ * as "pdbx" (extensions .cif, .mmcif) and, for scripts that name the old
+ * reader, as "mmcif", both with a higher version number than the plugins they
+ * replace, so VMD picks this one when several are loaded. No code is shared
+ * with either original implementation.
  *
  * What changed compared with the original plugin (0.14):
  *   - Atoms whose element symbol is not in the periodic table (coarse-grained
@@ -32,13 +34,18 @@
  *   - Unit cell from _cell (the 1 x 1 x 1 NMR/EM placeholder is ignored).
  *   - The writer emits valid, quoted, locale-independent mmCIF, one model per
  *     frame.
+ *   - gzip-compressed files (.cif.gz, as the PDB distributes them) are read
+ *     and written directly when built with zlib (_USE_ZLIB, as VMD's other
+ *     plugins do).
+ *   - Only some chains can be loaded: "file.cif?chain=A,B" or MMCIF_CHAIN
+ *     (from the former mmcif plugin).
  *
  * Robustness: memory stays proportional to the useful content of the file.
  * A single value is limited to 256 MiB and the number of models to one
  * million; models that do not match the first one keep no coordinates. Read
- * errors fail the load instead of truncating it, compressed and BinaryCIF
- * input is recognized and named, and text from the file is filtered before
- * it is printed.
+ * errors and damaged or truncated compressed data fail the load instead of
+ * truncating it, other compressed formats and BinaryCIF are recognized and
+ * named, and text from the file is filtered before it is printed.
  *
  * Reader field mapping (atom_site):
  *   name      <- label_atom_id        (fallback auth_atom_id, then type_symbol)
@@ -54,9 +61,17 @@
  *   occupancy <- occupancy, beta <- B_iso_or_equiv,
  *   charge    <- pdbx_formal_charge
  *
+ * Chain selection: "file.cif?chain=A,B" (the part after the last '?', unless
+ * a file with the whole name exists) or the MMCIF_CHAIN environment variable
+ * loads only atoms whose chain ID (the one stored in segname: the full ID, or
+ * the first 7 characters of a longer one) is listed. IDs are separated by
+ * commas or blanks and are case-sensitive. The result is exactly those atoms
+ * of the unselected load.
+ *
  * Environment variables:
  *   VMDPDBXUSELABELIDS   when set, chain/segname/resid come from label_asym_id
  *                        and label_seq_id instead of the author fields.
+ *   MMCIF_CHAIN          chains to load when the file name selects none.
  *
  * Author: Diego Enry Barreto Gomes
  * License: University of Illinois Open Source License
@@ -64,6 +79,7 @@
 
 #include "molfile_plugin.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
 #include <cfloat>
@@ -72,6 +88,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdarg>
 #include <map>
 #include <new>
 #include <set>
@@ -81,16 +98,22 @@
 #include <utility>
 #include <vector>
 
+#include <sys/types.h>
+#include <sys/stat.h>
+
 #if defined(_WIN32) || defined(_WIN64)
 typedef __int64 pdbx_off_t;
 #define PDBX_FSEEK _fseeki64
 #else
-#include <sys/types.h>
 typedef off_t pdbx_off_t;
 #define PDBX_FSEEK fseeko
 #endif
 
-#define PDBX_MAJOR_VERSION 1
+#ifdef _USE_ZLIB
+#include <zlib.h>
+#endif
+
+#define PDBX_MAJOR_VERSION 2
 #define PDBX_MINOR_VERSION 0
 
 namespace {
@@ -377,6 +400,19 @@ size_t g_read_buffer_bytes = (size_t)1 << 16;
 const size_t g_read_buffer_bytes = (size_t)1 << 16;
 #endif
 
+/* Compressed data can only be read forward: going back to re-read a damaged
+ * loop decompresses again from the start of the file. The total of that work
+ * is capped at a few times the data read, plus a fixed allowance, so that a
+ * file with many damaged loops cannot take quadratic time; past the cap the
+ * strict reading of a loop is kept, as for a pipe. */
+#ifdef PDBX_TEST_HOOKS
+long long g_gz_rewind_factor = 4;
+long long g_gz_rewind_extra = (long long)64 << 20;
+#else
+const long long g_gz_rewind_factor = 4;
+const long long g_gz_rewind_extra = (long long)64 << 20;
+#endif
+
 struct Token {
   TokKind kind;
   const char *p;     /* payload: block name, tag without '_', or value */
@@ -402,14 +438,33 @@ class CifReader {
  public:
   CifReader()
     : unterminated_quotes(0), unterminated_text(0), fp_(NULL), pos_(0), end_(0),
-      mark_(0), base_(0), eof_(false), prev_eol_(true), at_start_(true), line_(1) {}
-  ~CifReader() { if (fp_) fclose(fp_); }
+      mark_(0), base_(0), eof_(false), prev_eol_(true), at_start_(true), line_(1),
+      gz_(false), seekable_(false) {
+#ifdef _USE_ZLIB
+    memset(&zs_, 0, sizeof(zs_));
+    zs_init_ = zin_eof_ = zend_ = false;
+    zpos_ = zhigh_ = zrewound_ = 0;
+#endif
+  }
+  ~CifReader() {
+#ifdef _USE_ZLIB
+    if (zs_init_) inflateEnd(&zs_);
+#endif
+    if (fp_) fclose(fp_);
+  }
 
   bool open(const char *path) {
     fp_ = fopen(path, "rb");
     if (!fp_) return false;
+    seekable_ = (PDBX_FSEEK(fp_, 0, SEEK_CUR) == 0);      /* false for a pipe */
     buf_.resize(g_read_buffer_bytes > 0 ? g_read_buffer_bytes : 1);
     while (end_ < 8 && !eof_) refill();
+#ifdef _USE_ZLIB
+    if (end_ >= 2 && (unsigned char)buf_[0] == 0x1f && (unsigned char)buf_[1] == 0x8b) {
+      start_gzip();
+      while (end_ < 8 && !eof_) refill();
+    }
+#endif
     /* skip a UTF-8 byte order mark */
     if (end_ >= 3 && (unsigned char)buf_[0] == 0xEF &&
         (unsigned char)buf_[1] == 0xBB && (unsigned char)buf_[2] == 0xBF)
@@ -417,8 +472,11 @@ class CifReader {
     return true;
   }
 
-  /* Name of a compressed or binary format the file starts with, or NULL.
-   * Call right after open(). */
+  /* true if the file is gzip-compressed and being decompressed */
+  bool compressed() const { return gz_; }
+
+  /* Name of a compressed or binary format the data starts with (after
+   * decompression), or NULL. Call right after open(). */
   const char *binary_format() const {
     const unsigned char *b = (const unsigned char *)(buf_.empty() ? "" : &buf_[0]);
     size_t n = end_;
@@ -446,6 +504,20 @@ class CifReader {
     return s;
   }
 
+  /* Whether restore(s) is sure to succeed `times` times, whatever is read in
+   * between. A loop is re-read only if the reader can also come back to
+   * its normal reading; otherwise that reading would be lost. */
+  bool can_restore(const ReaderState &s, int times) const {
+    if (!fp_) return false;
+    const bool buffered = s.offset >= base_ && s.offset <= base_ + (pdbx_off_t)end_;
+    if (buffered && eof_) return true;      /* nothing is discarded any more */
+    if (!seekable_) return false;
+#ifdef _USE_ZLIB
+    if (gz_) return (long long)zrewound_ + times * (long long)s.offset <= gz_budget();
+#endif
+    return true;
+  }
+
   /* Rewind to a saved state (used to re-read a malformed loop). Fails on
    * non-seekable input such as a pipe, unless the state is still buffered. */
   bool restore(const ReaderState &s) {
@@ -453,8 +525,15 @@ class CifReader {
     if (s.offset >= base_ && s.offset <= base_ + (pdbx_off_t)end_) {
       pos_ = mark_ = (size_t)(s.offset - base_);     /* still in the buffer */
     } else {
-      if (PDBX_FSEEK(fp_, s.offset, SEEK_SET) != 0) return false;
-      clearerr(fp_);
+#ifdef _USE_ZLIB
+      if (gz_) {
+        if (!gz_seek(s.offset)) return false;
+      } else
+#endif
+      {
+        if (PDBX_FSEEK(fp_, s.offset, SEEK_SET) != 0) return false;
+        clearerr(fp_);
+      }
       base_ = s.offset;
       pos_ = end_ = mark_ = 0;
       eof_ = false;
@@ -481,6 +560,132 @@ class CifReader {
   bool prev_eol_;             /* char before pos_ is a line end (or BOF) */
   bool at_start_;             /* no token returned yet */
   long line_;
+  bool gz_;                   /* decompressing gzip data */
+  bool seekable_;             /* the file can be repositioned (not a pipe) */
+
+#ifdef _USE_ZLIB
+  z_stream zs_;
+  bool zs_init_;
+  std::vector<unsigned char> zin_;   /* compressed input */
+  bool zin_eof_;              /* no more compressed input */
+  bool zend_;                 /* last gzip member finished */
+  pdbx_off_t zpos_;           /* offset of the next decompressed byte */
+  pdbx_off_t zhigh_;          /* farthest offset decompressed so far */
+  pdbx_off_t zrewound_;       /* bytes decompressed again by gz_seek */
+
+  /* Switch to decompression; the bytes read so far are compressed input. */
+  void start_gzip() {
+    zin_.assign(std::max(std::max(g_read_buffer_bytes, (size_t)16), end_), 0);
+    memcpy(&zin_[0], &buf_[0], end_);
+    if (inflateInit2(&zs_, 15 + 16) != Z_OK)        /* gzip wrapper only */
+      throw std::runtime_error("cannot initialize zlib");
+    zs_init_ = true;
+    zs_.next_in = &zin_[0];
+    zs_.avail_in = (uInt)end_;
+    zin_eof_ = eof_;
+    zend_ = false;
+    zpos_ = zhigh_ = zrewound_ = 0;
+    gz_ = true;
+    pos_ = end_ = mark_ = 0;
+    base_ = 0;
+    eof_ = false;
+  }
+
+  /* More compressed input after what is left; false at the end of file. */
+  bool zfill() {
+    if (zin_eof_) return false;
+    size_t keep = zs_.avail_in;
+    if (keep >= zin_.size()) return true;
+    if (keep > 0 && zs_.next_in != &zin_[0]) memmove(&zin_[0], zs_.next_in, keep);
+    size_t want = zin_.size() - keep;
+    size_t got = fread(&zin_[keep], 1, want, fp_);
+    if (got < want && ferror(fp_))
+      throw std::runtime_error(std::string("read error: ") + strerror(errno));
+    if (got == 0) zin_eof_ = true;
+    zs_.next_in = &zin_[0];
+    zs_.avail_in = (uInt)(keep + got);
+    return got > 0;
+  }
+
+  /* Decompress up to want bytes; 0 only at the end of the data. */
+  size_t gz_read(char *dst, size_t want) {
+    if (zend_ || want == 0) return 0;
+    if (want > ((size_t)1 << 30)) want = (size_t)1 << 30;
+    zs_.next_out = (Bytef *)dst;
+    zs_.avail_out = (uInt)want;
+    while (zs_.avail_out == (uInt)want) {          /* until some output */
+      if (zs_.avail_in == 0 && !zfill())
+        throw std::runtime_error("the compressed data ends early (incomplete download "
+                                 "or truncated .gz file)");
+      int r = inflate(&zs_, Z_NO_FLUSH);
+      if (r == Z_STREAM_END) {
+        /* another gzip member may follow (concatenated .gz files) */
+        if (zs_.avail_in < 2) zfill();
+        if (zs_.avail_in >= 2 && zs_.next_in[0] == 0x1f && zs_.next_in[1] == 0x8b) {
+          if (inflateReset(&zs_) != Z_OK) throw std::runtime_error("zlib error");
+          continue;
+        }
+        /* After the last member only zero padding may follow. Anything else
+         * is most likely a damaged member header, and ignoring it would load
+         * part of the file as if it were all of it. */
+        for (;;) {
+          for (uInt i = 0; i < zs_.avail_in; i++)
+            if (zs_.next_in[i] != 0)
+              throw std::runtime_error("the compressed data is damaged (unexpected bytes "
+                                       "after a gzip member)");
+          zs_.avail_in = 0;
+          if (!zfill()) break;
+        }
+        zend_ = true;
+        break;
+      }
+      if (r == Z_BUF_ERROR && zs_.avail_in == 0) continue;   /* needs more input */
+      if (r != Z_OK)
+        throw std::runtime_error(std::string("the compressed data is damaged (") +
+                                 (zs_.msg ? zs_.msg : "zlib error") + ")");
+    }
+    size_t got = want - zs_.avail_out;
+    zpos_ += (pdbx_off_t)got;
+    if (zpos_ > zhigh_) zhigh_ = zpos_;
+    return got;
+  }
+
+  /* how many bytes may be decompressed again, in total */
+  long long gz_budget() const {
+    return g_gz_rewind_factor * (long long)zhigh_ + g_gz_rewind_extra;
+  }
+
+  /* Continue decompressing at offset off of the decompressed data. */
+  bool gz_seek(pdbx_off_t off) {
+    if (off < zpos_) {
+      if ((long long)zrewound_ + (long long)off > gz_budget()) return false;
+      if (PDBX_FSEEK(fp_, 0, SEEK_SET) != 0) return false;   /* e.g. a pipe */
+      clearerr(fp_);
+      if (inflateReset(&zs_) != Z_OK) return false;
+      zs_.next_in = &zin_[0];
+      zs_.avail_in = 0;
+      zin_eof_ = zend_ = false;
+      zpos_ = 0;
+      zrewound_ += off;
+    }
+    std::vector<char> skip((size_t)1 << 16);
+    while (zpos_ < off) {
+      size_t n = (size_t)std::min((pdbx_off_t)skip.size(), off - zpos_);
+      if (gz_read(&skip[0], n) == 0) return false;
+    }
+    return true;
+  }
+#endif
+
+  size_t raw_read(char *dst, size_t want) {
+#ifdef _USE_ZLIB
+    if (gz_) return gz_read(dst, want);
+#endif
+    size_t got = fread(dst, 1, want, fp_);
+    if (got < want && ferror(fp_))   /* never mistake an I/O error for the end */
+      throw std::runtime_error(std::string("read error: ") + strerror(errno));
+    return got;
+  }
 
   /* Keep [mark_, end_), read more data. True if pos_ < end_ afterwards. */
   bool refill() {
@@ -500,9 +705,7 @@ class CifReader {
       buf_.resize(buf_.size() * 2);
     }
     size_t want = buf_.size() - end_;
-    size_t got = fread(&buf_[end_], 1, want, fp_);
-    if (got < want && ferror(fp_))   /* never mistake an I/O error for the end */
-      throw std::runtime_error(std::string("read error: ") + strerror(errno));
+    size_t got = raw_read(&buf_[end_], want);
     if (got == 0) {
       eof_ = true;
       return pos_ < end_;
@@ -838,6 +1041,77 @@ const int kSeqMissing = INT_MIN;
  * this, rows of new models are ignored so bookkeeping stays bounded. */
 const size_t kMaxModels = 1000000;
 
+/* Chains to load ("file.cif?chain=A,B" or MMCIF_CHAIN). Matched against the
+ * chain ID stored in segname (auth_asym_id, or label_asym_id with
+ * VMDPDBXUSELABELIDS): the full ID, or for a longer ID its first 7
+ * characters as segname shows them. Case-sensitive, as chain IDs are. */
+struct ChainFilter {
+  std::vector<std::string> ids;     /* sorted, unique */
+  std::vector<char> hit;            /* ids[i] occurs in the file */
+  std::string source;               /* where the selection came from */
+
+  ChainFilter() : have_last_(false), last_k_(-1) {}
+  bool active() const { return !ids.empty(); }
+
+  /* add IDs separated by commas or blanks */
+  void add(const std::string &list) {
+    size_t i = 0;
+    while (i < list.size()) {
+      while (i < list.size() && (list[i] == ',' || is_ws(list[i]))) i++;
+      size_t b = i;
+      while (i < list.size() && list[i] != ',' && !is_ws(list[i])) i++;
+      if (i > b) ids.push_back(list.substr(b, i - b));
+    }
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    hit.assign(ids.size(), 0);
+    have_last_ = false;
+  }
+
+  /* index of chain in ids, or -1. A chain ID longer than segname holds is
+   * also selected by its first characters, which is what VMD shows. */
+  int find(const std::string &chain) {
+    if (have_last_ && chain == last_) return last_k_;       /* rows come in runs */
+    const size_t seglen = sizeof(molfile_atom_t::segid) - 1;
+    last_k_ = index_of(chain);
+    if (last_k_ < 0 && chain.size() > seglen) last_k_ = index_of(chain.substr(0, seglen));
+    last_ = chain;
+    have_last_ = true;
+    return last_k_;
+  }
+
+  /* selected? (and remember that it occurs) */
+  bool accepts(const std::string &chain) {
+    int k = find(chain);
+    if (k >= 0) hit[(size_t)k] = 1;
+    return k >= 0;
+  }
+
+  /* "A, B" -- all IDs, or only those (not) found in the file */
+  std::string list(int which = 0) const {
+    std::string s;
+    size_t shown = 0;
+    for (size_t i = 0; i < ids.size(); i++) {
+      if ((which > 0 && !hit[i]) || (which < 0 && hit[i])) continue;
+      if (shown++ == 20) { s += ", ..."; break; }
+      if (!s.empty()) s += ", ";
+      s += printable(ids[i], 20);
+    }
+    return s;
+  }
+
+ private:
+  bool have_last_;
+  int last_k_;
+  std::string last_;
+
+  int index_of(const std::string &id) const {
+    std::vector<std::string>::const_iterator it =
+        std::lower_bound(ids.begin(), ids.end(), id);
+    return (it != ids.end() && *it == id) ? (int)(it - ids.begin()) : -1;
+  }
+};
+
 /* A later model. Its rows are compared with the first model as they arrive;
  * once one differs, its coordinates are dropped, since it cannot be a frame. */
 struct ExtraModel {
@@ -853,7 +1127,13 @@ struct ExtraModel {
 class AtomSink : public Sink {
  public:
   explicit AtomSink(const ColAlias *aliases, bool use_label)
-    : aliases_(aliases), use_label_(use_label), ncols_(0) { reset(); }
+    : aliases_(aliases), use_label_(use_label), filter_(NULL), ncols_(0) { reset(); }
+
+  /* load only rows of these chains (NULL: all) */
+  void set_filter(ChainFilter *f) {
+    filter_ = (f && f->active()) ? f : NULL;
+    found.assign(filter_ ? filter_->ids.size() : 0, 0);
+  }
 
   /* model 1 (structure) */
   ChunkedArray<molfile_atom_t> atoms;
@@ -878,6 +1158,10 @@ class AtomSink : public Sink {
   long multichar_chain, long_chain, long_altloc, long_name, long_resname;
   long missing_resid;
   long dropped_model_rows;      /* rows of models beyond kMaxModels */
+  long filtered_rows;           /* rows of chains not selected */
+  std::vector<char> found;      /* with a filter: ids[i] has atoms in the structure */
+  std::vector<std::string> chains_seen;   /* with a filter: chains of the first model */
+  bool more_chains;             /* chains_seen is incomplete */
   bool any_altloc, any_insertion, any_charge;
   std::map<std::string, long> unknown_symbols;
 
@@ -893,6 +1177,10 @@ class AtomSink : public Sink {
     multichar_chain = long_chain = long_altloc = long_name = long_resname = 0;
     missing_resid = 0;
     dropped_model_rows = 0;
+    filtered_rows = 0;
+    found.assign(found.size(), 0);
+    chains_seen.clear();
+    more_chains = false;
     any_altloc = any_insertion = any_charge = false;
     unknown_symbols.clear();
     recovering_ = false;
@@ -959,7 +1247,9 @@ class AtomSink : public Sink {
   long bad_rows() const {
     return bad_coord_rows + bad_group_rows + bad_field_rows + dropped_rows;
   }
-  size_t nrows() const { return atoms.size(); }
+  /* rows with coordinates, including those of chains not selected: the
+   * first data block with coordinates is the one read, whatever the filter */
+  size_t nrows() const { return atoms.size() + (size_t)filtered_rows; }
 
  private:
   struct ColProfile {
@@ -984,6 +1274,7 @@ class AtomSink : public Sink {
 
   const ColAlias *aliases_;
   bool use_label_;
+  ChainFilter *filter_;
   size_t ncols_;
   std::vector<int> colmap_;                /* column -> AtomCol, or -1 */
   int srccol_[AC_NUM];                     /* AtomCol -> column, or -1 */
@@ -1269,6 +1560,25 @@ class AtomSink : public Sink {
 
     int model = select_model();
     if (model < 0) { dropped_model_rows++; return; }
+
+    /* Chain selection: after the counts above, which judge how the loop was
+     * read and must not depend on it, and after the model of the row is
+     * known, so that the first model still defines the structure: the
+     * selection gives exactly the selected atoms of the unselected load.
+     * Later models are compared on the selected atoms only. */
+    if (filter_) {
+      int k = filter_->find(chain);
+      if (model == 0) {
+        if (k >= 0) found[(size_t)k] = 1;
+        if (chains_seen.empty() || chains_seen.back() != chain) {
+          if (std::find(chains_seen.begin(), chains_seen.end(), chain) == chains_seen.end()) {
+            if (chains_seen.size() < 50) chains_seen.push_back(chain);
+            else more_chains = true;
+          }
+        }
+      }
+      if (k < 0) { filtered_rows++; return; }
+    }
     if (model > 0) {
       ExtraModel &m = extra[(size_t)model - 1];
       size_t k = m.rows++;
@@ -1531,9 +1841,12 @@ class Parser {
      * shifted, may have rows with missing values. Re-read it so that each
      * row starts on a new line, as virtually every mmCIF writer emits them,
      * and keep that reading only if it is cleaner: a valid loop that packs
-     * several rows per line must keep its normal reading. */
+     * several rows per line must keep its normal reading. This needs two
+     * rewinds (there and possibly back), so it is done only when both are
+     * sure to work: a pipe, or compressed input past its rewind budget,
+     * keeps the normal reading. */
     if (!repeated && misaligned > 0 && (partial || strict_bad > 0) &&
-        reader_.restore(start)) {
+        reader_.can_restore(start, 2) && reader_.restore(start)) {
       has_pending_ = false;
       s->reset();
       s->begin(items);
@@ -1675,7 +1988,7 @@ const char *const kChemCompBondItems[] = {
   "comp_id", "atom_id_1", "atom_id_2", "value_order", NULL
 };
 const char *const kSphereItems[] = {
-  "cartn_x", "cartn_y", "cartn_z", "object_radius", "model_id", NULL
+  "cartn_x", "cartn_y", "cartn_z", "object_radius", "model_id", "asym_id", NULL
 };
 
 struct ParseContext {
@@ -1867,9 +2180,13 @@ std::vector<int> by_residue_name(const AtomSink &as, const std::vector<int> &c,
   return out.empty() ? c : out;
 }
 
+/* With a chain selection, a record naming a chain of which no atom was
+ * loaded is counted as outside the selection; every other record that does
+ * not match is unmatched, as without a selection. */
 void resolve_bonds(const AtomSink &as, const std::vector<BondRequest> &req,
-                   PdbxHandle *h, long *unresolved) {
+                   PdbxHandle *h, long *unresolved, bool filtered, long *outside) {
   if (req.empty()) return;
+  long *no_chain = filtered ? outside : unresolved;  /* a partner's chain not loaded */
   const size_t natoms = as.atoms.size();
 
   /* lookup keys needed by the requests, and which chains are involved */
@@ -1899,7 +2216,7 @@ void resolve_bonds(const AtomSink &as, const std::vector<BondRequest> &req,
     }
     req_slots[i] = std::make_pair(sl[0], sl[1]);
   }
-  if (cand.empty()) { *unresolved += (long)req.size(); return; }
+  if (cand.empty()) { *no_chain += (long)req.size(); return; }
 
   /* one pass over the atoms of the involved chains. Atoms sharing a key are
    * alternate locations (rarely more than 4); the cap bounds the pairing work
@@ -1951,7 +2268,7 @@ void resolve_bonds(const AtomSink &as, const std::vector<BondRequest> &req,
   std::set<std::pair<int, int> > seen;
   for (size_t i = 0; i < req.size(); i++) {
     int s1 = req_slots[i].first, s2 = req_slots[i].second;
-    if (s1 < 0 || s2 < 0) { (*unresolved)++; continue; }
+    if (s1 < 0 || s2 < 0) { (*no_chain)++; continue; }
     bool made = false;
     const std::vector<int> c1 = by_residue_name(as, cand[(size_t)s1], req[i].a.comp);
     const std::vector<int> c2 = by_residue_name(as, cand[(size_t)s2], req[i].b.comp);
@@ -2074,13 +2391,18 @@ bool build_from_chem_comp(const Table &atoms, const Table &bonds, PdbxHandle *h,
 
 /* ---- IHM spheres as raw graphics (same behavior as the original plugin) ---- */
 
-void build_spheres(const Table &t, PdbxHandle *h) {
+/* with a chain selection, spheres are matched by their asym_id */
+void build_spheres(const Table &t, PdbxHandle *h, ChainFilter *filter, long *filtered) {
   if (t.nrows == 0) return;
   int cx = t.col("cartn_x"), cy = t.col("cartn_y"), cz = t.col("cartn_z");
-  int cr = t.col("object_radius"), cmod = t.col("model_id");
+  int cr = t.col("object_radius"), cmod = t.col("model_id"), casym = t.col("asym_id");
   const std::string first_model = t.get(0, cmod);
   for (size_t r = 0; r < t.nrows; r++) {
     if (t.get(r, cmod) != first_model) continue;
+    if (filter && filter->active() && !filter->accepts(t.get(r, casym))) {
+      (*filtered)++;
+      continue;
+    }
     molfile_graphics_t g;
     memset(&g, 0, sizeof(g));
     float rad = 1.0f;
@@ -2158,24 +2480,100 @@ void report_atom_warnings(const AtomSink &as, const char *cat) {
  * Reader callbacks
  * ======================================================================== */
 
-void *open_pdbx_read(const char *filepath, const char *filetype, int *natoms) {
+/* "file.cif?chain=A,B": options after the last '?' of a name that is not
+ * itself an existing file. Without a chain option, MMCIF_CHAIN applies.
+ * Returns false with a message for an option it does not know. */
+bool split_options(const char *filepath, std::string *path, ChainFilter *filter,
+                   std::string *err) {
+  *path = filepath;
+  const char *q = strrchr(filepath, '?');
+  struct stat st;
+  /* Options are "key=value" pairs. A known key starts them, whatever its
+   * value holds (a chain ID may contain '/'); any other "word=" is an
+   * unknown option only if no path separator follows, since otherwise the
+   * '?' is part of a directory name. */
+  if (q) {
+    size_t k = 0;
+    while (is_alpha(q[1 + k]) || is_digit(q[1 + k]) || q[1 + k] == '_') k++;
+    const std::string key = lowercase(q + 1, k);
+    const bool known = q[1 + k] == '=' && (key == "chain" || key == "chains");
+    const bool option_like = k > 0 && q[1 + k] == '=' && !strchr(q, '/') && !strchr(q, '\\');
+    if (!known && !option_like) q = NULL;
+  }
+  if (q && stat(filepath, &st) != 0) {
+    path->assign(filepath, (size_t)(q - filepath));
+    const std::string opts(q + 1);
+    size_t i = 0;
+    while (i < opts.size()) {
+      size_t amp = opts.find('&', i);
+      if (amp == std::string::npos) amp = opts.size();
+      const std::string kv = opts.substr(i, amp - i);
+      i = amp + 1;
+      if (kv.empty()) continue;
+      size_t eq = kv.find('=');
+      const std::string key = lowercase(kv.data(), eq == std::string::npos ? kv.size() : eq);
+      if ((key == "chain" || key == "chains") && eq != std::string::npos) {
+        filter->add(kv.substr(eq + 1));
+        filter->source = "the file name";
+      } else {
+        *err = "unknown option '" + printable(kv) + "' after '?' in the file name "
+               "(supported: ?chain=A,B)";
+        return false;
+      }
+    }
+    if (!filter->active()) {
+      *err = "no chain IDs after '?chain=' in the file name";
+      return false;
+    }
+  }
+  if (!filter->active()) {
+    const char *env = getenv("MMCIF_CHAIN");
+    if (env && *env) {
+      filter->add(env);
+      if (filter->active()) filter->source = "MMCIF_CHAIN";
+    }
+  }
+  return true;
+}
+
+void *open_pdbx_read(const char *filepath_arg, const char *filetype, int *natoms) {
   (void)filetype;
-  if (!filepath || !natoms) return NULL;
+  if (!filepath_arg || !natoms) return NULL;
   PdbxHandle *h = NULL;
+  std::string path_buf;
+  const char *filepath = filepath_arg;           /* for messages until split */
   try {
+    ChainFilter filter;
+    std::string err;
+    if (!split_options(filepath_arg, &path_buf, &filter, &err)) {
+      printf("pdbxplugin) %s: %s\n", printable(filepath_arg, 200).c_str(), err.c_str());
+      return NULL;
+    }
+    filepath = path_buf.c_str();
     CifReader reader;
     if (!reader.open(filepath)) {
       printf("pdbxplugin) Unable to open file %s: %s\n", filepath, strerror(errno));
       return NULL;
     }
     if (const char *fmt = reader.binary_format()) {
-      printf("pdbxplugin) %s is %s; this plugin reads text mmCIF files%s\n", filepath,
-             fmt, strstr(fmt, "compressed") ? " (decompress it first)" : "");
+      const char *hint = "";
+      if (strstr(fmt, "compressed")) hint = " (decompress it first)";
+#ifndef _USE_ZLIB
+      if (strstr(fmt, "gzip")) hint = " (decompress it first: this build has no zlib)";
+#endif
+      if (reader.compressed())
+        printf("pdbxplugin) %s: the decompressed data is %s; this plugin reads text "
+               "mmCIF files\n", filepath, fmt);
+      else
+        printf("pdbxplugin) %s is %s; this plugin reads text mmCIF files%s\n", filepath,
+               fmt, hint);
       return NULL;
     }
     h = new PdbxHandle();
     const bool use_label = (getenv("VMDPDBXUSELABELIDS") != NULL);
     ParseContext ctx(use_label);
+    ctx.atom_site.set_filter(&filter);
+    ctx.ihm_start.set_filter(&filter);
 
     Parser parser(reader);
     parser.add_sink("atom_site", &ctx.atom_site);
@@ -2204,7 +2602,8 @@ void *open_pdbx_read(const char *filepath, const char *filetype, int *natoms) {
              "one with coordinates was read\n");
 
     read_cell(ctx.cell.table, h);
-    build_spheres(ctx.spheres.table, h);
+    long filtered_spheres = 0;
+    build_spheres(ctx.spheres.table, h, &filter, &filtered_spheres);
 
     AtomSink *as = NULL;
     const char *cat = "atom_site";
@@ -2213,7 +2612,7 @@ void *open_pdbx_read(const char *filepath, const char *filetype, int *natoms) {
 
     report_recovered_loops(parser, as, cat);
 
-    long n_bonds_req = 0, unresolved = 0, skipped_symm = 0;
+    long n_bonds_req = 0, unresolved = 0, skipped_symm = 0, outside = 0;
     if (as) {
       report_atom_warnings(*as, cat);
 
@@ -2227,6 +2626,8 @@ void *open_pdbx_read(const char *filepath, const char *filetype, int *natoms) {
         if (em.matches && em.rows == n && em.xyz.size() == 3 * n) {
           h->frames.push_back(ChunkedArray<float>());
           h->frames.back().swap(em.xyz);
+        } else if (em.rows == 0) {
+          /* a model without rows of the selected chains: not a frame */
         } else if (++skipped <= 3) {
           printf("pdbxplugin) Warning: model %s (%lu atoms) does not match the %lu "
                  "atoms of model %s; skipped\n", printable(em.key).c_str(),
@@ -2249,7 +2650,7 @@ void *open_pdbx_read(const char *filepath, const char *filetype, int *natoms) {
       collect_validate(ctx.val_bond.table, 2, req, as->model0_key);
       collect_validate(ctx.val_angle.table, 3, req, as->model0_key);
       n_bonds_req = (long)req.size();
-      resolve_bonds(*as, req, h, &unresolved);
+      resolve_bonds(*as, req, h, &unresolved, filter.active(), &outside);
 
       int fl = MOLFILE_INSERTION;
       if (as->n_known_elem + as->n_unknown_elem > 0) fl |= MOLFILE_ATOMICNUMBER;
@@ -2268,6 +2669,10 @@ void *open_pdbx_read(const char *filepath, const char *filetype, int *natoms) {
         if (n_unknown > 0)
           printf("pdbxplugin) Note: %ld atom(s) have element symbols that are not in "
                  "VMD's periodic table; loaded as element X\n", n_unknown);
+        if (filter.active())
+          printf("pdbxplugin) Note: the chain selection (%s, from %s) does not apply to "
+                 "a chemical component file; all atoms were loaded\n",
+                 filter.list().c_str(), filter.source.c_str());
       }
     }
 
@@ -2275,10 +2680,33 @@ void *open_pdbx_read(const char *filepath, const char *filetype, int *natoms) {
     if (h->bond_from.size() > (size_t)INT_MAX || h->graphics.size() > (size_t)INT_MAX)
       throw std::runtime_error("too many bonds or graphics objects");
     h->natoms = (int)h->atoms.size();
+    const bool filtered = filter.active() && !h->bonds_complete;
+    const long n_filtered = (as ? as->filtered_rows : 0) + filtered_spheres;
+    /* selected chains with atoms in the structure, or spheres (filter.hit
+     * holds the sphere matches) */
+    if (filtered && as)
+      for (size_t i = 0; i < filter.hit.size() && i < as->found.size(); i++)
+        if (as->found[i]) filter.hit[i] = 1;
+    const bool multi_model = as && !as->extra.empty();
     if (h->natoms == 0 && h->graphics.empty()) {
       long bad = ctx.atom_site.bad_coord_rows + ctx.ihm_start.bad_coord_rows +
                  ctx.atom_site.dropped_rows + ctx.ihm_start.dropped_rows;
-      if (bad > 0)
+      if (filtered && n_filtered > 0) {
+        std::string have;
+        if (as) {
+          for (size_t i = 0; i < as->chains_seen.size(); i++) {
+            if (i == 20) { have += ", ..."; break; }
+            if (!have.empty()) have += ", ";
+            have += as->chains_seen[i].empty() ? std::string("(none)")
+                                                : printable(as->chains_seen[i], 20);
+          }
+          if (as->more_chains && as->chains_seen.size() <= 20) have += ", ...";
+        }
+        printf("pdbxplugin) No atoms loaded from %s: chain(s) %s (selected by %s) have "
+               "no atoms with coordinates in the %s%s%s\n", filepath, filter.list().c_str(),
+               filter.source.c_str(), multi_model ? "first model" : "file",
+               have.empty() ? "" : ", whose chains are ", have.c_str());
+      } else if (bad > 0)
         printf("pdbxplugin) No atoms loaded from %s: none of the %ld atom row(s) has "
                "usable coordinates\n", filepath, bad);
       else
@@ -2298,10 +2726,24 @@ void *open_pdbx_read(const char *filepath, const char *filetype, int *natoms) {
     if (!h->graphics.empty())
       printf(", %lu IHM sphere(s) as graphics", (unsigned long)h->graphics.size());
     if (use_label) printf(" [label_asym_id/label_seq_id numbering]");
+    if (reader.compressed()) printf(" [gzip]");
     printf("\n");
+    if (filtered) {
+      printf("pdbxplugin) Note: loaded only chain(s) %s (selected by %s)",
+             filter.list(1).c_str(), filter.source.c_str());
+      if (n_filtered > 0) printf("; skipped %ld row(s) of other chains", n_filtered);
+      printf("\n");
+      std::string missing = filter.list(-1);
+      if (!missing.empty())
+        printf("pdbxplugin) Warning: chain(s) %s have no atoms with coordinates in the %s\n",
+               missing.c_str(), multi_model ? "first model" : "file");
+    }
     if (unresolved > 0)
-      printf("pdbxplugin) Note: %ld of %ld explicit bond record(s) did not match atoms "
-             "in the file\n", unresolved, n_bonds_req);
+      printf("pdbxplugin) Note: %ld of %ld explicit bond record(s) did not match %s\n",
+             unresolved, n_bonds_req, filtered ? "the loaded atoms" : "atoms in the file");
+    if (outside > 0)
+      printf("pdbxplugin) Note: skipped %ld explicit bond record(s) to chains that were "
+             "not loaded\n", outside);
     if (skipped_symm > 0)
       printf("pdbxplugin) Note: skipped %ld bond(s) to symmetry-related copies\n",
              skipped_symm);
@@ -2382,15 +2824,128 @@ void close_pdbx_read(void *v) {
  * Writer
  * ======================================================================== */
 
+/* Writer output: buffered text, gzip-compressed for a name ending in .gz. */
+class Out {
+ public:
+  Out() : fp_(NULL), gz_(false), error_(false) {
+#ifdef _USE_ZLIB
+    memset(&zs_, 0, sizeof(zs_));
+    zinit_ = false;
+#endif
+  }
+  ~Out() {
+#ifdef _USE_ZLIB
+    if (zinit_) deflateEnd(&zs_);
+#endif
+    if (fp_) fclose(fp_);
+  }
+
+  /* false with a message in *err */
+  bool open(const char *path, bool gz, std::string *err) {
+#ifndef _USE_ZLIB
+    if (gz) { *err = "this build has no zlib, so it cannot write .gz files"; return false; }
+#endif
+    fp_ = fopen(path, "wb");
+    if (!fp_) { *err = strerror(errno); return false; }
+#ifdef _USE_ZLIB
+    if (gz) {
+      if (deflateInit2(&zs_, 6, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+        *err = "cannot initialize zlib";
+        return false;
+      }
+      zinit_ = true;
+      zout_.resize((size_t)1 << 16);
+    }
+#endif
+    gz_ = gz;
+    return true;
+  }
+
+  void put(const char *s) { put(s, strlen(s)); }
+  void put(const char *s, size_t n) {
+    buf_.append(s, n);
+    if (buf_.size() >= kFlushBytes) flush(false);
+  }
+  void put(char c) {
+    buf_ += c;
+    if (buf_.size() >= kFlushBytes) flush(false);
+  }
+  void format(const char *fmt, ...) {
+    char b[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    if (n < 0) { error_ = true; return; }
+    if ((size_t)n < sizeof(b)) { put(b, (size_t)n); return; }
+    std::vector<char> big((size_t)n + 1);
+    va_start(ap, fmt);
+    vsnprintf(&big[0], big.size(), fmt, ap);
+    va_end(ap);
+    put(&big[0], (size_t)n);
+  }
+
+  bool error() const { return error_; }
+
+  /* flush everything and close; false if anything failed */
+  bool close() {
+    if (!fp_) return false;
+    flush(true);
+#ifdef _USE_ZLIB
+    if (zinit_) { deflateEnd(&zs_); zinit_ = false; }
+#endif
+    if (fclose(fp_) != 0) error_ = true;
+    fp_ = NULL;
+    return !error_;
+  }
+
+ private:
+  static const size_t kFlushBytes = (size_t)1 << 16;
+  FILE *fp_;
+  bool gz_, error_;
+  std::string buf_;
+#ifdef _USE_ZLIB
+  z_stream zs_;
+  bool zinit_;
+  std::vector<unsigned char> zout_;
+#endif
+
+  void flush(bool final) {
+    if (!fp_ || error_) { buf_.clear(); return; }
+#ifdef _USE_ZLIB
+    if (gz_) {
+      zs_.next_in = (Bytef *)(buf_.empty() ? NULL : &buf_[0]);
+      zs_.avail_in = (uInt)buf_.size();
+      for (;;) {
+        zs_.next_out = &zout_[0];
+        zs_.avail_out = (uInt)zout_.size();
+        int r = deflate(&zs_, final ? Z_FINISH : Z_NO_FLUSH);
+        if (r == Z_STREAM_ERROR) { error_ = true; break; }
+        size_t n = zout_.size() - zs_.avail_out;
+        if (n && fwrite(&zout_[0], 1, n, fp_) != n) { error_ = true; break; }
+        if (final ? (r == Z_STREAM_END) : (zs_.avail_in == 0 && zs_.avail_out > 0)) break;
+      }
+      buf_.clear();
+      return;
+    }
+#else
+    (void)final;
+#endif
+    if (!buf_.empty() && fwrite(buf_.data(), 1, buf_.size(), fp_) != buf_.size())
+      error_ = true;
+    buf_.clear();
+  }
+};
+
 struct PdbxWriter {
-  FILE *fp;
+  Out out;
   std::string block;
   int natoms;
   int optflags;
   std::vector<molfile_atom_t> atoms;
   int nframes;
   bool io_error;
-  PdbxWriter() : fp(NULL), natoms(0), optflags(0), nframes(0), io_error(false) {}
+  PdbxWriter() : natoms(0), optflags(0), nframes(0), io_error(false) {}
 };
 
 /* The text the writer stores for a field: without the padding molfile fields
@@ -2418,9 +2973,9 @@ bool quote_fits(const std::string &v, char q) {
 }
 
 /* Write a value, quoting only when CIF requires it. */
-void put_value(FILE *fp, const char *s, const char *null_tok) {
+void put_value(Out &o, const char *s, const char *null_tok) {
   std::string v = cif_text(s);
-  if (v.empty()) { fputs(null_tok, fp); return; }
+  if (v.empty()) { o.put(null_tok); return; }
 
   bool quote = false;
   char c0 = v[0];
@@ -2434,37 +2989,37 @@ void put_value(FILE *fp, const char *s, const char *null_tok) {
   for (size_t i = 0; i < v.size() && !quote; i++)
     if (v[i] == ' ') quote = true;
 
-  if (!quote) { fputs(v.c_str(), fp); return; }
+  if (!quote) { o.put(v.c_str()); return; }
   if (quote_fits(v, '\'') || quote_fits(v, '"')) {
     char q = quote_fits(v, '\'') ? '\'' : '"';
-    fputc(q, fp);
-    fputs(v.c_str(), fp);
-    fputc(q, fp);
+    o.put(q);
+    o.put(v.c_str());
+    o.put(q);
     return;
   }
   /* both quote kinds occur before a blank: only a text field holds it */
-  fputs("\n;", fp);
-  fputs(v.c_str(), fp);
-  fputs("\n;", fp);
+  o.put("\n;");
+  o.put(v.c_str());
+  o.put("\n;");
 }
 
 /* Fixed-point formatting independent of LC_NUMERIC. */
-void put_fixed(FILE *fp, double v, int decimals) {
-  if (!std::isfinite(v)) { fputs("?", fp); return; }
+void put_fixed(Out &o, double v, int decimals) {
+  if (!std::isfinite(v)) { o.put("?"); return; }
   double scaled = v * kPow10[decimals];
   if (std::fabs(scaled) >= 9.0e18) {
     /* too large for fixed point: mantissa and exponent, still locale free */
     int e = (int)std::floor(std::log10(std::fabs(v)));
     double m = v / std::pow(10.0, (double)e);
-    put_fixed(fp, m, 6);
-    fprintf(fp, "e%d", e);
+    put_fixed(o, m, 6);
+    o.format("e%d", e);
     return;
   }
   long long iv = std::llround(scaled);
   bool neg = iv < 0;
   unsigned long long u = (unsigned long long)(neg ? -iv : iv);
   unsigned long long p = (unsigned long long)kPow10[decimals];
-  fprintf(fp, "%s%llu.%0*llu", neg ? "-" : "", u / p, decimals, u % p);
+  o.format("%s%llu.%0*llu", neg ? "-" : "", u / p, decimals, u % p);
 }
 
 bool is_polymer_residue(const char *resname) {
@@ -2519,9 +3074,11 @@ void *open_pdbx_write(const char *path, const char *filetype, int natoms) {
   PdbxWriter *w = NULL;
   try {
     w = new PdbxWriter();
-    w->fp = fopen(path, "w");
-    if (!w->fp) {
-      printf("pdbxplugin) Unable to open %s for writing\n", path);
+    const size_t plen = strlen(path);
+    const bool gz = plen > 3 && iequals(path + plen - 3, 3, ".gz");
+    std::string err;
+    if (!w->out.open(path, gz, &err)) {
+      printf("pdbxplugin) Unable to open %s for writing: %s\n", path, err.c_str());
       delete w;
       return NULL;
     }
@@ -2532,6 +3089,7 @@ void *open_pdbx_write(const char *path, const char *filetype, int natoms) {
     for (const char *p = path; *p; p++)
       if (*p == '/' || *p == '\\') base = p + 1;
     std::string name(base);
+    if (gz) name.erase(name.size() - std::min(name.size(), (size_t)3));
     size_t dot = name.rfind('.');
     if (dot != std::string::npos && dot > 0) name.erase(dot);
     for (size_t i = 0; i < name.size(); i++)
@@ -2539,8 +3097,7 @@ void *open_pdbx_write(const char *path, const char *filetype, int natoms) {
     w->block = name.empty() ? std::string("vmd") : name;
     return w;
   } catch (...) {
-    if (w && w->fp) fclose(w->fp);
-    delete w;
+    delete w;                 /* Out closes the file */
     return NULL;
   }
 }
@@ -2557,19 +3114,19 @@ int write_pdbx_structure(void *v, int optflags, const molfile_atom_t *atoms) {
 }
 
 void write_header(PdbxWriter *w, const molfile_timestep_t *ts) {
-  FILE *fp = w->fp;
-  fputs("data_", fp);
-  fputs(w->block.c_str(), fp);
-  fprintf(fp, "\n# written by the VMD pdbx plugin %d.%d\n#\n",
+  Out &o = w->out;
+  o.put("data_");
+  o.put(w->block.c_str());
+  o.format("\n# written by the VMD pdbx plugin %d.%d\n#\n",
           PDBX_MAJOR_VERSION, PDBX_MINOR_VERSION);
   if (ts && ts->A > 0 && ts->B > 0 && ts->C > 0) {
-    fputs("_cell.length_a    ", fp); put_fixed(fp, ts->A, 3); fputc('\n', fp);
-    fputs("_cell.length_b    ", fp); put_fixed(fp, ts->B, 3); fputc('\n', fp);
-    fputs("_cell.length_c    ", fp); put_fixed(fp, ts->C, 3); fputc('\n', fp);
-    fputs("_cell.angle_alpha ", fp); put_fixed(fp, ts->alpha, 2); fputc('\n', fp);
-    fputs("_cell.angle_beta  ", fp); put_fixed(fp, ts->beta, 2); fputc('\n', fp);
-    fputs("_cell.angle_gamma ", fp); put_fixed(fp, ts->gamma, 2); fputc('\n', fp);
-    fputs("#\n_symmetry.space_group_name_H-M 'P 1'\n#\n", fp);
+    o.put("_cell.length_a    "); put_fixed(o, ts->A, 3); o.put('\n');
+    o.put("_cell.length_b    "); put_fixed(o, ts->B, 3); o.put('\n');
+    o.put("_cell.length_c    "); put_fixed(o, ts->C, 3); o.put('\n');
+    o.put("_cell.angle_alpha "); put_fixed(o, ts->alpha, 2); o.put('\n');
+    o.put("_cell.angle_beta  "); put_fixed(o, ts->beta, 2); o.put('\n');
+    o.put("_cell.angle_gamma "); put_fixed(o, ts->gamma, 2); o.put('\n');
+    o.put("#\n_symmetry.space_group_name_H-M 'P 1'\n#\n");
   }
   static const char *const items[] = {
     "group_PDB", "id", "type_symbol", "label_atom_id", "label_alt_id",
@@ -2578,12 +3135,12 @@ void write_header(PdbxWriter *w, const molfile_timestep_t *ts) {
     "B_iso_or_equiv", "pdbx_formal_charge", "auth_seq_id", "auth_comp_id",
     "auth_asym_id", "auth_atom_id", "pdbx_PDB_model_num", NULL
   };
-  fputs("loop_\n", fp);
-  for (int i = 0; items[i]; i++) fprintf(fp, "_atom_site.%s\n", items[i]);
+  o.put("loop_\n");
+  for (int i = 0; items[i]; i++) o.format("_atom_site.%s\n", items[i]);
 }
 
 void write_atoms(PdbxWriter *w, const float *coords, int model) {
-  FILE *fp = w->fp;
+  Out &o = w->out;
   const int fl = w->optflags;
   for (int i = 0; i < w->natoms; i++) {
     const molfile_atom_t &a = w->atoms[(size_t)i];
@@ -2596,40 +3153,40 @@ void write_atoms(PdbxWriter *w, const float *coords, int model) {
     char ins[2] = { (fl & MOLFILE_INSERTION) ? a.insertion[0] : '\0', '\0' };
     char num[32];
 
-    fputs(polymer ? "ATOM   " : "HETATM ", fp);
-    fprintf(fp, "%lld ", (long long)(model - 1) * w->natoms + i + 1);
-    put_value(fp, elem.c_str(), "?");               fputc(' ', fp);
-    put_value(fp, name.c_str(), "?");               fputc(' ', fp);
-    put_value(fp, alt, ".");                        fputc(' ', fp);
-    put_value(fp, resname.c_str(), "?");            fputc(' ', fp);
-    put_value(fp, chain.c_str(), "?");              fputs(" ? ", fp);
-    if (polymer) fprintf(fp, "%d ", a.resid); else fputs(". ", fp);
-    put_value(fp, ins, "?");                        fputc(' ', fp);
+    o.put(polymer ? "ATOM   " : "HETATM ");
+    o.format("%lld ", (long long)(model - 1) * w->natoms + i + 1);
+    put_value(o, elem.c_str(), "?");               o.put(' ');
+    put_value(o, name.c_str(), "?");               o.put(' ');
+    put_value(o, alt, ".");                        o.put(' ');
+    put_value(o, resname.c_str(), "?");            o.put(' ');
+    put_value(o, chain.c_str(), "?");              o.put(" ? ");
+    if (polymer) o.format("%d ", a.resid); else o.put(". ");
+    put_value(o, ins, "?");                        o.put(' ');
     if (coords) {
-      put_fixed(fp, coords[3 * i], 3);     fputc(' ', fp);
-      put_fixed(fp, coords[3 * i + 1], 3); fputc(' ', fp);
-      put_fixed(fp, coords[3 * i + 2], 3); fputc(' ', fp);
+      put_fixed(o, coords[3 * i], 3);     o.put(' ');
+      put_fixed(o, coords[3 * i + 1], 3); o.put(' ');
+      put_fixed(o, coords[3 * i + 2], 3); o.put(' ');
     } else {
-      fputs("0.000 0.000 0.000 ", fp);
+      o.put("0.000 0.000 0.000 ");
     }
-    put_fixed(fp, (fl & MOLFILE_OCCUPANCY) ? a.occupancy : 1.0, 2); fputc(' ', fp);
-    put_fixed(fp, (fl & MOLFILE_BFACTOR) ? a.bfactor : 0.0, 2);     fputc(' ', fp);
+    put_fixed(o, (fl & MOLFILE_OCCUPANCY) ? a.occupancy : 1.0, 2); o.put(' ');
+    put_fixed(o, (fl & MOLFILE_BFACTOR) ? a.bfactor : 0.0, 2);     o.put(' ');
     /* only integral charges are formal charges */
     if ((fl & MOLFILE_CHARGE) && std::isfinite(a.charge) &&
         std::fabs(a.charge - std::floor(a.charge + 0.5f)) < 1e-3f &&
         std::fabs(a.charge) < 100.0f) {
       snprintf(num, sizeof(num), "%d ", (int)std::floor(a.charge + 0.5f));
-      fputs(num, fp);
+      o.put(num);
     } else {
-      fputs("? ", fp);
+      o.put("? ");
     }
-    fprintf(fp, "%d ", a.resid);
-    put_value(fp, resname.c_str(), "?");            fputc(' ', fp);
-    put_value(fp, chain.c_str(), "?");              fputc(' ', fp);
-    put_value(fp, name.c_str(), "?");               fputc(' ', fp);
-    fprintf(fp, "%d\n", model);
+    o.format("%d ", a.resid);
+    put_value(o, resname.c_str(), "?");            o.put(' ');
+    put_value(o, chain.c_str(), "?");              o.put(' ');
+    put_value(o, name.c_str(), "?");               o.put(' ');
+    o.format("%d\n", model);
   }
-  if (ferror(fp)) w->io_error = true;
+  if (o.error()) w->io_error = true;
 }
 
 int write_pdbx_timestep(void *v, const molfile_timestep_t *ts) {
@@ -2648,24 +3205,25 @@ int write_pdbx_timestep(void *v, const molfile_timestep_t *ts) {
 
 void close_pdbx_write(void *v) {
   PdbxWriter *w = (PdbxWriter *)v;
-  if (w->fp) {
+  if (w) {
     try {
       if (w->nframes == 0 && w->atoms.size() == (size_t)w->natoms) {
         /* structure without coordinates: keep the atom records anyway */
         write_header(w, NULL);
         write_atoms(w, NULL, 1);
       }
+      if (w->nframes > 0 || !w->atoms.empty()) w->out.put("#\n");
     } catch (...) {
       w->io_error = true;
     }
-    if (w->nframes > 0 || !w->atoms.empty()) fputs("#\n", w->fp);
-    if (fclose(w->fp) != 0 || w->io_error)
+    if (!w->out.close() || w->io_error)
       printf("pdbxplugin) Error while writing the mmCIF file\n");
   }
   delete w;
 }
 
 molfile_plugin_t plugin;
+molfile_plugin_t mmcif_alias;    /* same reader and writer, for "type mmcif" */
 
 } /* namespace */
 
@@ -2683,7 +3241,7 @@ VMDPLUGIN_API int VMDPLUGIN_init(void) {
   plugin.majorv = PDBX_MAJOR_VERSION;
   plugin.minorv = PDBX_MINOR_VERSION;
   plugin.is_reentrant = VMDPLUGIN_THREADSAFE;
-  plugin.filename_extension = "cif";
+  plugin.filename_extension = "cif,mmcif";
   plugin.open_file_read = open_pdbx_read;
   plugin.read_structure = read_pdbx_structure;
   plugin.read_bonds = read_pdbx_bonds;
@@ -2694,11 +3252,20 @@ VMDPLUGIN_API int VMDPLUGIN_init(void) {
   plugin.write_structure = write_pdbx_structure;
   plugin.write_timestep = write_pdbx_timestep;
   plugin.close_file_write = close_pdbx_write;
+
+  /* The repository's former "mmcif" reader is merged into this plugin. The
+   * alias keeps "mol new ... type mmcif" working and, with its higher
+   * version, shadows an old mmcifplugin.so that is still installed. */
+  mmcif_alias = plugin;
+  mmcif_alias.name = "mmcif";
+  mmcif_alias.prettyname = "mmCIF (same as PDBx)";
+  mmcif_alias.filename_extension = "mmcif";
   return VMDPLUGIN_SUCCESS;
 }
 
 VMDPLUGIN_API int VMDPLUGIN_register(void *v, vmdplugin_register_cb cb) {
   (*cb)(v, (vmdplugin_t *)&plugin);
+  (*cb)(v, (vmdplugin_t *)&mmcif_alias);
   return VMDPLUGIN_SUCCESS;
 }
 

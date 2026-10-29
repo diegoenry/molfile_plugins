@@ -3,6 +3,8 @@
 # Usage (headless):
 #   vmd -dispdev text -e tests/vmd_checks.tcl -args /path/to/pdbxplugin.so tests/data [extra.cif ...]
 #
+# The .gz checks need gzip on the PATH and a plugin built with zlib.
+#
 # Prints CHECK lines (PASS/FAIL) and exits.
 
 set plugin_so [lindex $argv 0]
@@ -22,8 +24,12 @@ proc check {what cond {detail ""}} {
 
 plugin dlopen $plugin_so
 plugin info "mol file reader" pdbx pinfo
-check "VMD uses the new pdbx plugin" [expr {$pinfo(majorversion) >= 1}] \
+check "VMD uses the new pdbx plugin" [expr {$pinfo(majorversion) >= 2}] \
     "found version $pinfo(majorversion).$pinfo(minorversion) by $pinfo(author)"
+plugin info "mol file reader" mmcif minfo
+check "the mmcif name is this plugin too" \
+    [expr {$minfo(majorversion) >= 2 && $minfo(author) eq $pinfo(author)}] \
+    "found version $minfo(majorversion).$minfo(minorversion)"
 
 # 1. unknown element symbols no longer abort the load; type extension picks pdbx
 set m [mol new [file join $data nonstandard_elements.cif] waitfor all]
@@ -78,7 +84,45 @@ check "VMDPDBXUSELABELIDS gives label_seq_id numbering" \
 mol delete $m
 unset env(VMDPDBXUSELABELIDS)
 
-# 6. optional extra files: chemical components must come with bond orders
+# 6. chain selection in the file name, and the mmcif name
+set m [mol new "[file join $data chains.cif]?chain=A" type mmcif waitfor all]
+set s [atomselect $m all]
+check "?chain=A with type mmcif: 5 atoms of chain A" \
+    [expr {[$s num] == 5 && [lsort -unique [$s get segname]] eq {A}}] [$s get segname]
+check "?chain=A: model 2 is a frame for chain A" [expr {[molinfo $m get numframes] == 2}]
+$s delete
+mol delete $m
+set env(MMCIF_CHAIN) "AA a"
+set m [mol new [file join $data chains.cif] waitfor all]
+check "MMCIF_CHAIN selects chains AA and a" \
+    [expr {[lsort -unique [[atomselect $m all] get segname]] eq {AA a}}]
+mol delete $m
+unset env(MMCIF_CHAIN)
+
+# 7. .cif.gz: read (VMD guesses the type from the last extension only, so
+# "type pdbx" is needed), write, read back
+set gz [file join [pwd] vmd_checks_models.cif.gz]
+if {[catch {exec gzip -c [file join $data models.cif] > $gz} err]} {
+    check "gzip available" 0 $err
+} else {
+    set m [mol new $gz type pdbx waitfor all]
+    check "models.cif.gz loads with type pdbx" \
+        [expr {[molinfo $m get numatoms] == 3 && [molinfo $m get numframes] == 2}]
+    set out [file join [pwd] vmd_checks_out.cif.gz]
+    animate write pdbx $out beg 0 end -1 waitfor all $m
+    set fh [open $out rb]; binary scan [read $fh 2] H4 magic; close $fh
+    check "animate write pdbx to .cif.gz writes gzip" [expr {$magic eq "1f8b"}] $magic
+    set m2 [mol new $out type pdbx waitfor all]
+    set a [atomselect $m all frame 1]
+    set b [atomselect $m2 all frame 1]
+    check "the written .cif.gz reads back" [expr {[molinfo $m2 get numframes] == 2 &&
+        [$a get {name x y z}] eq [$b get {name x y z}]}]
+    $a delete; $b delete
+    mol delete $m; mol delete $m2
+    file delete $gz $out
+}
+
+# 8. optional extra files: chemical components must come with bond orders
 foreach f $extra {
     set m [mol new $f type pdbx waitfor all]
     set s [atomselect $m all]

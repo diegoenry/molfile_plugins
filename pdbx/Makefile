@@ -1,6 +1,7 @@
-# Makefile for the PDBx/mmCIF VMD molfile plugin (pdbx 1.0)
+# Makefile for the PDBx/mmCIF VMD molfile plugin (pdbx 2.0)
 #
-#   make                 build pdbxplugin.so
+#   make                 build pdbxplugin.so (with .cif.gz support if zlib is found)
+#   make ZLIB=0          build without zlib
 #   make install         copy it into VMD's molfile plugin directory
 #   make test            build the test driver and run it on tests/data/*.cif
 #   make asan            same driver built with AddressSanitizer + UBSan
@@ -62,6 +63,17 @@ CXX      ?= c++
 CXXFLAGS ?= -O2 -Wall -Wextra
 CXXFLAGS += -std=c++11 -fPIC
 
+# zlib for reading and writing .cif.gz (VMD's _USE_ZLIB convention); found
+# automatically unless ZLIB=0 or ZLIB=1 is given.
+ifndef ZLIB
+    ZLIB := $(shell printf '\043include <zlib.h>\nint main(void){return zlibVersion()==0;}\n' | \
+              $(CXX) -x c++ - -o /dev/null -lz >/dev/null 2>&1 && echo 1 || echo 0)
+endif
+ifeq ($(ZLIB),1)
+    ZLIB_CFLAGS = -D_USE_ZLIB
+    ZLIB_LIBS   = -lz
+endif
+
 ifeq ($(UNAME_S),Darwin)
     LDFLAGS_PLUGIN = -bundle -undefined dynamic_lookup
 else
@@ -82,21 +94,27 @@ FUZZ_DIR  ?= $(or $(TMPDIR),/tmp)/pdbx_fuzz
 FUZZ_TIME ?= 300
 FUZZ_JOBS ?= 4
 
+# the plugin's environment variables would change the test results
+unexport MMCIF_CHAIN VMDPDBXUSELABELIDS
+
 all: $(PLUGIN)
 
 $(PLUGIN): pdbxplugin.C
-	$(CXX) $(CXXFLAGS) -I'$(VMD_PLUGIN_INCLUDE)' -o $@ pdbxplugin.C $(LDFLAGS_PLUGIN)
+	$(CXX) $(CXXFLAGS) $(ZLIB_CFLAGS) -I'$(VMD_PLUGIN_INCLUDE)' -o $@ pdbxplugin.C \
+	    $(LDFLAGS_PLUGIN) $(ZLIB_LIBS)
 
-$(DRIVER): tests/pdbx_dump.cpp pdbxplugin.C
-	$(CXX) $(CXXFLAGS) -I'$(VMD_PLUGIN_INCLUDE)' -o $@ tests/pdbx_dump.cpp
+$(DRIVER): tests/pdbx_dump.cpp pdbxplugin.C Makefile
+	$(CXX) $(CXXFLAGS) $(ZLIB_CFLAGS) -I'$(VMD_PLUGIN_INCLUDE)' -o $@ tests/pdbx_dump.cpp \
+	    $(ZLIB_LIBS)
 
 $(ASAN): tests/pdbx_dump.cpp pdbxplugin.C
 	$(CXX) -std=c++11 -g -O1 -fno-omit-frame-pointer -fsanitize=address,undefined \
-	    -I'$(VMD_PLUGIN_INCLUDE)' -o $@ tests/pdbx_dump.cpp
+	    $(ZLIB_CFLAGS) -I'$(VMD_PLUGIN_INCLUDE)' -o $@ tests/pdbx_dump.cpp $(ZLIB_LIBS)
 
 # Each fixture's summary line must match tests/expected.txt; then every
 # fixture that loads must survive a write/read round trip unchanged; then the
-# error paths (compressed input, read errors, pipes, console output).
+# error paths (compressed input, read errors, pipes, console output), chain
+# selection and .gz files.
 test: $(DRIVER)
 	@for f in $(TESTCIF); do \
 	    printf '%s ' "$$f"; ./$(DRIVER) -q "$$f" 2>/dev/null | grep '^RESULT' || echo "RESULT failed"; \
@@ -112,6 +130,7 @@ test: $(DRIVER)
 	echo "summary lines: same with 1, 2, 3 and 7-byte read buffers"
 	@sh tests/roundtrip.sh ./$(DRIVER) $(TESTCIF)
 	@sh tests/messages.sh ./$(DRIVER)
+	@sh tests/options.sh ./$(DRIVER) $(ZLIB)
 	@rm -f tests/actual.txt
 
 asan: $(ASAN)
@@ -122,7 +141,7 @@ asan: $(ASAN)
 $(FUZZER): tests/fuzz_pdbx.cpp pdbxplugin.C
 	$(FUZZ_CXX) -std=c++11 -g -O1 -fno-omit-frame-pointer \
 	    -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
-	    -I'$(VMD_PLUGIN_INCLUDE)' -o $@ tests/fuzz_pdbx.cpp
+	    $(ZLIB_CFLAGS) -I'$(VMD_PLUGIN_INCLUDE)' -o $@ tests/fuzz_pdbx.cpp $(ZLIB_LIBS)
 
 # Runs FUZZ_JOBS fuzzers for FUZZ_TIME seconds, seeded with tests/data.
 # Inputs that crash, hang (>10 s) or use more than 2 GB are saved in FUZZ_DIR.
@@ -143,6 +162,7 @@ config:
 	@echo "VMD_PLUGIN_INCLUDE: $(VMD_PLUGIN_INCLUDE)"
 	@echo "VMD_PLUGIN_DIR:     $(VMD_PLUGIN_DIR)"
 	@echo "CXX / CXXFLAGS:     $(CXX) $(CXXFLAGS)"
+	@echo "ZLIB (.cif.gz):     $(ZLIB)"
 
 clean:
 	rm -f $(PLUGIN) $(DRIVER) $(ASAN) $(FUZZER) tests/actual.txt fuzz-*.log
