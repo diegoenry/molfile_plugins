@@ -1,9 +1,10 @@
-# pdbx — PDBx/mmCIF reader and writer for VMD (v2.0)
+# pdbx — PDBx/mmCIF reader and writer for VMD (v2.1)
 
 A from-scratch rewrite of VMD's `pdbx` molfile plugin, and the only mmCIF
 plugin in this repository: the separate `mmcif` reader that used to live in
-`../mmcif` is merged into it. It registers as `pdbx` (files ending in `.cif`
-or `.mmcif`) and also as `mmcif`, so scripts that say `type mmcif` keep
+`../mmcif` is merged into it. It reads text mmCIF and BinaryCIF, plain or
+gzip-compressed. It registers as `pdbx` (files ending in `.cif`, `.mmcif` or
+`.bcif`) and also as `mmcif`, so scripts that say `type mmcif` keep
 working. Both names have a higher version than the plugins they replace
 (built-in pdbx 0.14, mmcif 1.x), so VMD uses this one once it is loaded, even
 if an old `mmcifplugin.so` is still installed.
@@ -26,7 +27,7 @@ ordinary entries such as 4hhb, 1hzh and 6vxx.
 
 ## What it does now
 
-| | old pdbx 0.14 | new pdbx 2.0 |
+| | old pdbx 0.14 | new pdbx 2.1 |
 |---|---|---|
 | Unknown element symbol | whole load aborted | atom loads as element `X`; symbol kept in `type` |
 | Revised PDB entries (4hhb, 1hzh, 6vxx, ...) | fail | load |
@@ -42,6 +43,7 @@ ordinary entries such as 4hhb, 1hzh and 6vxx.
 | Writer | malformed output for empty fields or names with spaces | valid, quoted, locale-independent mmCIF, one model per frame |
 | `.cif.gz` (as the PDB distributes files) | not read | read and written directly (when built with zlib) |
 | Loading only some chains | no | `file.cif?chain=A,B` or `MMCIF_CHAIN` |
+| BinaryCIF (`.bcif`, as served by RCSB, PDBe and Mol*) | not read | read, also `.bcif.gz`, exactly like the text file |
 
 For 1crn, 4hhb, 1d3z, 1ejg, 1hzh, 1bna, 2n9k and 6vxx, every atom field VMD
 exposes matches what VMD's own PDB reader gives for the `.pdb` version of the
@@ -64,6 +66,7 @@ bonds, NMR models as frames, and the chain selection (`?chain=A,B`,
 | Rows with missing or extra values | the rest of the table shifted | repaired or skipped (see Damaged rows) |
 | Bonds to symmetry copies | added between the wrong atoms | skipped |
 | Several data blocks, IHM files, ligand files | not read | read |
+| BinaryCIF | no | yes |
 | Writing | no | yes |
 
 ## Build and load
@@ -80,6 +83,7 @@ Load it for one session (or put the line in `~/.vmdrc`):
 ```tcl
 plugin dlopen /path/to/pdbxplugin.so
 mol new myfile.cif                    ;# picked by extension, or: type pdbx
+mol new 1abc.bcif                     ;# BinaryCIF, also picked by extension
 mol new 1abc.cif.gz type pdbx         ;# VMD only looks at the last extension (.gz)
 mol new "myfile.cif?chain=A,B" type pdbx
 animate write pdbx out.cif.gz         ;# a name ending in .gz is written compressed
@@ -88,7 +92,7 @@ animate write pdbx out.cif.gz         ;# a name ending in .gz is written compres
 To make it permanent, `make install` copies it into VMD's molfile plugin
 directory. VMD prefers the higher version number, so it shadows the built-in
 plugin without removing it. To check which one is active:
-`plugin info "mol file reader" pdbx p; parray p` shows version 2.0.
+`plugin info "mol file reader" pdbx p; parray p` shows version 2.1.
 
 For a static VMD build, copy `pdbxplugin.C` over
 `plugins/molfile_plugin/src/pdbxplugin.C`. It is a single C++11 file with no
@@ -192,6 +196,18 @@ Notes:
   start, so that work is capped (a few times the file size). The table is
   re-read only if the plugin can also go back to its normal reading; past
   the cap, as for a pipe, it keeps the normal reading.
+- **BinaryCIF.** Recognized by its content, so a `.bcif.gz` or a `.bcif`
+  with another name works too. The columns the plugin uses are decoded and
+  turned back into the text a CIF file holds (a coordinate stored as
+  17.047 reads as `17.047`), so everything above applies unchanged and a
+  `.bcif` loads exactly like the `.cif` it was made from. The file is read
+  whole, so loading needs more memory than text (3j3q in VMD: 1.24 GB
+  instead of 1.04 GB) but is as fast (3.2 s; the file is 29 MB instead of
+  241 MB). Damaged files fail with a message naming the column and the
+  problem; every size and offset is checked, and a file cannot claim far
+  more values than its size allows. All seven encodings of the format are
+  read (ByteArray, FixedPoint, IntervalQuantization, RunLength, Delta,
+  IntegerPacking, StringArray).
 - **IHM.** `_ihm_starting_model_coord` is read when there is no `_atom_site`,
   and `_ihm_sphere_obj_site` spheres of the first model become VMD graphics,
   as in the original plugin. For coarse-grained spheres as real atoms, use
@@ -214,8 +230,10 @@ Notes:
   bytes) are written as `_`, and a value that neither quote style can hold is
   written as a text field.
 - gzip is the only compression read (without zlib, not even that). bzip2,
-  xz, zstd, zip and BinaryCIF (`.bcif`) are recognized and rejected with a
-  message that says so.
+  xz, zstd and zip are recognized and rejected with a message that says so.
+- BinaryCIF is read, not written: a name ending in `.bcif` is refused by the
+  writer. A BinaryCIF file larger than 1 GiB (decompressed) is refused; the
+  largest PDB entries are far below that.
 - VMD picks a plugin by the last extension only, so `.cif.gz` needs
   `type pdbx`. The plugin does not claim `.gz` itself, since that would
   route every compressed format to it.
@@ -229,7 +247,7 @@ Notes:
 ```sh
 make test     # 30 fixtures in tests/data: summary lines vs tests/expected.txt (also
               # with 1-7 byte read buffers), write/read round trip, error paths,
-              # chain selection, .gz reading and writing
+              # chain selection, .gz reading and writing, BinaryCIF (tests/bcif)
 make asan     # the same driver built with AddressSanitizer + UBSan
 make fuzz     # coverage-guided fuzzing (libFuzzer); FUZZ_TIME=300 seconds, FUZZ_JOBS=4
 make ZLIB=0 test   # the build without zlib
@@ -254,6 +272,19 @@ make ZLIB=0 test   # the build without zlib
   truncated, damaged, concatenated, padded and nested `.gz` files, `.gz`
   from a pipe, writing `.cif.gz`, and that both plugin names are registered.
   The test scripts unset `MMCIF_CHAIN` and `VMDPDBXUSELABELIDS` first.
+- `tests/bcif.sh` checks BinaryCIF: every file in `tests/bcif` must load
+  exactly like its text source (also with tiny buffers, from `.gz`, and with
+  a chain selection), each damaged `bad_*.bcif` must fail with the message
+  listed in `tests/bcif/bad.txt`, every truncation of a file must fail
+  cleanly, and the writer must refuse a `.bcif` name.
+- `tests/make_bcif.py` made the files in `tests/bcif`, which are committed,
+  so the tests need no Python. Run it only to change them:
+  `uv run --with mmcif --with msgpack python tests/make_bcif.py`. It converts
+  text fixtures with RCSB's py-mmcif (the encoder behind
+  `models.rcsb.org/<id>.bcif`), writes `encodings.bcif` and its text twin
+  `encodings.cif` using every encoding (also those py-mmcif never uses),
+  checks those two with py-mmcif's own decoder, and writes the damaged
+  files.
 - `tests/fuzz_pdbx.cpp` is a libFuzzer target. Each input is read twice, with
   the normal buffer and with one of a few bytes, and both readings must agree
   exactly. Every input that loads is also written and read back, and the
@@ -261,14 +292,15 @@ make ZLIB=0 test   # the build without zlib
   the writer stores losslessly. Each input is also gzip-compressed (sometimes
   in two members) and must read the same from the `.gz`, and the chain of
   one atom is selected with `?chain=`: that load must hold exactly that
-  chain's atoms of the full load. It needs a clang
+  chain's atoms of the full load. The BinaryCIF files in `tests/bcif` are
+  among the seeds, so the fuzzer also mutates BinaryCIF. It needs a clang
   that ships libFuzzer (Homebrew `llvm`; Apple's clang does not). Corpus and
   crash files go to `$TMPDIR/pdbx_fuzz`.
 - `tests/compare_with_pdb.tcl` runs in VMD and compares `ID.cif` (this plugin)
   against `ID.pdb` (VMD's PDB reader), field by field.
 - `tests/vmd_checks.tcl` runs end-to-end checks inside VMD: unknown elements,
   frames, writing, bonds, IHM graphics, label numbering, the `mmcif` name,
-  chain selection, and reading and writing `.cif.gz`.
+  chain selection, reading and writing `.cif.gz`, and BinaryCIF.
 
 ```sh
 vmd -dispdev text -e tests/vmd_checks.tcl -args $PWD/pdbxplugin.so $PWD/tests/data
@@ -305,6 +337,28 @@ make tests/pdbx_dump
 ./tests/pdbx_dump -q ~/pdbx_test/4v6x.cif
 ```
 
+BinaryCIF versions of the same entries come from RCSB's model server. Each
+must load exactly like the `.cif` (run in bash or zsh):
+
+```sh
+cd ~/pdbx_test
+for id in 1crn 4hhb 1d3z 1ejg 1hzh 1bna 2n9k 6vxx; do
+    curl -fL -o $id.bcif https://models.rcsb.org/$id.bcif
+done
+cd -                      # back to the pdbx directory
+for id in 1crn 4hhb 1d3z 1ejg 1hzh 1bna 2n9k 6vxx; do
+    if cmp -s <(./tests/pdbx_dump -c ~/pdbx_test/$id.cif  | grep -v '^pdbxplugin)') \
+              <(./tests/pdbx_dump -c ~/pdbx_test/$id.bcif | grep -v '^pdbxplugin)')
+    then echo "$id same"; else echo "$id DIFF"; fi
+done
+```
+
+The server sometimes cuts off a large download (curl then exits with an
+error, and the plugin reports the file as truncated). The model server's
+query form, `https://models.rcsb.org/v1/<id>/full?encoding=bcif`, is written
+by Mol*'s encoder instead; it holds the same atoms in a different order and
+leaves out some tables (such as the validation bonds).
+
 Chemical component files come from a different URL and can be passed to
 `vmd_checks.tcl` as extra arguments. They print their bond orders:
 
@@ -315,13 +369,21 @@ vmd -dispdev text -e tests/vmd_checks.tcl -args \
 ```
 
 Verified on 11 PDB entries (up to the 2.4-million-atom 3j3q), the 30 fixtures,
-a 3,300-file mutation corpus, and about 2.4 million coverage-guided fuzzing
-runs under AddressSanitizer/UBSan, the last 230,000 of them on the final code
-with the gzip and chain-selection checks, with no sanitizer reports, crashes
-or hangs. gemmi reads the writer's output, plain and `.gz`, exactly as this
-plugin does, including hostile names. Loading 3j3q in VMD takes about the
-same time and memory as the original plugin (2.9 s, 1.0 GB), and reading
-3J3Q.cif.gz as the PDB distributes it takes the same as the plain file.
+a 3,300-file mutation corpus, and about 2.6 million coverage-guided fuzzing
+runs under AddressSanitizer/UBSan, the last 218,000 of them on the final code
+with BinaryCIF seeds and the gzip and chain-selection checks, with no
+sanitizer reports, crashes or hangs. gemmi reads the writer's output, plain
+and `.gz`, exactly as this plugin does, including hostile names. Loading 3j3q
+in VMD takes about the same time and memory as the original plugin (2.9 s,
+1.0 GB), and reading 3J3Q.cif.gz as the PDB distributes it takes the same as
+the plain file.
+
+BinaryCIF was checked against both encoders in use: for the 8 entries above,
+RCSB's `.bcif` files (py-mmcif) load identically to the `.cif`, field by
+field and frame by frame, and the Mol* model server's files hold the same
+atoms and coordinates. So does 3j3q converted with py-mmcif. 1,500 randomly
+corrupted BinaryCIF files under AddressSanitizer all loaded or failed
+cleanly.
 
 Author: Diego Enry Barreto Gomes. University of Illinois Open Source License
 (see the repository README).

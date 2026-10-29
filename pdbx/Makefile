@@ -1,4 +1,4 @@
-# Makefile for the PDBx/mmCIF VMD molfile plugin (pdbx 2.0)
+# Makefile for the PDBx/mmCIF VMD molfile plugin (pdbx 2.1)
 #
 #   make                 build pdbxplugin.so (with .cif.gz support if zlib is found)
 #   make ZLIB=0          build without zlib
@@ -114,7 +114,7 @@ $(ASAN): tests/pdbx_dump.cpp pdbxplugin.C
 # Each fixture's summary line must match tests/expected.txt; then every
 # fixture that loads must survive a write/read round trip unchanged; then the
 # error paths (compressed input, read errors, pipes, console output), chain
-# selection and .gz files.
+# selection and .gz files, BinaryCIF.
 test: $(DRIVER)
 	@for f in $(TESTCIF); do \
 	    printf '%s ' "$$f"; ./$(DRIVER) -q "$$f" 2>/dev/null | grep '^RESULT' || echo "RESULT failed"; \
@@ -131,6 +131,7 @@ test: $(DRIVER)
 	@sh tests/roundtrip.sh ./$(DRIVER) $(TESTCIF)
 	@sh tests/messages.sh ./$(DRIVER)
 	@sh tests/options.sh ./$(DRIVER) $(ZLIB)
+	@sh tests/bcif.sh ./$(DRIVER) $(ZLIB)
 	@rm -f tests/actual.txt
 
 asan: $(ASAN)
@@ -143,13 +144,14 @@ $(FUZZER): tests/fuzz_pdbx.cpp pdbxplugin.C
 	    -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
 	    $(ZLIB_CFLAGS) -I'$(VMD_PLUGIN_INCLUDE)' -o $@ tests/fuzz_pdbx.cpp $(ZLIB_LIBS)
 
-# Runs FUZZ_JOBS fuzzers for FUZZ_TIME seconds, seeded with tests/data.
+# Runs FUZZ_JOBS fuzzers for FUZZ_TIME seconds, seeded with tests/data and
+# tests/bcif.
 # Inputs that crash, hang (>10 s) or use more than 2 GB are saved in FUZZ_DIR.
 fuzz: $(FUZZER)
 	@mkdir -p '$(FUZZ_DIR)/corpus' '$(FUZZ_DIR)/crashes'
 	./$(FUZZER) -max_total_time=$(FUZZ_TIME) -jobs=$(FUZZ_JOBS) -workers=$(FUZZ_JOBS) \
 	    -max_len=16384 -timeout=10 -rss_limit_mb=2048 -dict=tests/fuzz.dict \
-	    -artifact_prefix='$(FUZZ_DIR)/crashes/' '$(FUZZ_DIR)/corpus' tests/data
+	    -artifact_prefix='$(FUZZ_DIR)/crashes/' '$(FUZZ_DIR)/corpus' tests/data tests/bcif
 
 install: $(PLUGIN)
 	@echo "Installing $(PLUGIN) into $(VMD_PLUGIN_DIR)"

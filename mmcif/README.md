@@ -3,7 +3,7 @@
 The `mmcif` reader that lived here is now part of the single mmCIF plugin in
 [`../pdbx`](../pdbx/README.md). That plugin registers under both names,
 `pdbx` and `mmcif`, so scripts that say `mol new file.cif type mmcif` keep
-working, and its higher version (2.0) makes VMD prefer it over an old
+working, and its higher version (2.0 and later) makes VMD prefer it over an old
 `mmcifplugin.so` that is still installed.
 
 Everything this reader did is there, including chain selection with
