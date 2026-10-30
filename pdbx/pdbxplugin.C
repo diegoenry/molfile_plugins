@@ -81,11 +81,16 @@
  * License: University of Illinois Open Source License
  */
 
+/* vmdplugin.h includes windows.h on Windows: keep its min/max macros out */
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
 #include "molfile_plugin.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstdint>
 #include <cfloat>
 #include <climits>
 #include <cmath>
@@ -412,7 +417,7 @@ const size_t g_read_buffer_bytes = (size_t)1 << 16;
 #ifdef PDBX_TEST_HOOKS
 long long g_gz_rewind_factor = 4;
 long long g_gz_rewind_extra = (long long)64 << 20;
-#else
+#elif defined(_USE_ZLIB)
 const long long g_gz_rewind_factor = 4;
 const long long g_gz_rewind_extra = (long long)64 << 20;
 #endif
@@ -546,6 +551,8 @@ class CifReader {
     if (!seekable_) return false;
 #ifdef _USE_ZLIB
     if (gz_) return (long long)zrewound_ + times * (long long)s.offset <= gz_budget();
+#else
+    (void)times;
 #endif
     return true;
   }

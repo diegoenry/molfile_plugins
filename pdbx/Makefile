@@ -84,7 +84,7 @@ PLUGIN  = pdbxplugin.so
 DRIVER  = tests/pdbx_dump
 ASAN    = tests/pdbx_dump_asan
 FUZZER  = tests/fuzz_pdbx
-TESTCIF = $(wildcard tests/data/*.cif)
+TESTCIF = $(sort $(wildcard tests/data/*.cif))   # same order on every make
 
 # Coverage-guided fuzzing needs a clang that ships libFuzzer (Apple's does
 # not; Homebrew's llvm does). Corpus and crash files go to FUZZ_DIR.
