@@ -39,9 +39,9 @@ same() { grep -q '^RESULT' "$1" && grep -q '^RESULT' "$2" && cmp -s "$1" "$2"; }
 # ---- registration --------------------------------------------------------
 
 "$driver" -l > "$tmp/out" 2>&1
-if grep -q '^PLUGIN pdbx 2\.0 cif,mmcif mol file reader reader=yes writer=yes' "$tmp/out" &&
-   grep -q '^PLUGIN mmcif 2\.0 mmcif mol file reader reader=yes writer=yes' "$tmp/out"; then
-    ok "registers pdbx and the mmcif alias (2.0)"
+if grep -q '^PLUGIN pdbx 2\.1 cif,mmcif,bcif mol file reader reader=yes writer=yes' "$tmp/out" &&
+   grep -q '^PLUGIN mmcif 2\.1 mmcif mol file reader reader=yes writer=yes' "$tmp/out"; then
+    ok "registers pdbx and the mmcif alias (2.1)"
 else
     bad "plugin registration"
 fi
@@ -260,7 +260,7 @@ check "damaged second gzip member" "open-failed" "compressed data is damaged" "$
 gzip -c "$tmp/m.cif.gz" > "$tmp/twice.cif.gz"
 check "gzip inside gzip" "open-failed" "decompressed data is gzip-compressed" "$tmp/twice.cif.gz"
 printf '\203\244data\300\250encoder' | gzip -c > "$tmp/bcif.gz"
-check "gzip-compressed BinaryCIF" "open-failed" "decompressed data is BinaryCIF" "$tmp/bcif.gz"
+check "gzip-compressed, damaged BinaryCIF" "open-failed" "BinaryCIF: the data ends" "$tmp/bcif.gz"
 : | gzip -c > "$tmp/empty.cif.gz"
 check "empty .gz" "open-failed" "No atom coordinates found" "$tmp/empty.cif.gz"
 

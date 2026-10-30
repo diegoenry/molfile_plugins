@@ -122,7 +122,22 @@ if {[catch {exec gzip -c [file join $data models.cif] > $gz} err]} {
     file delete $gz $out
 }
 
-# 8. optional extra files: chemical components must come with bond orders
+# 8. BinaryCIF: picked by the .bcif extension, read like the text file
+set bcif [file join [file dirname $data] bcif]
+set m [mol new [file join $bcif models.bcif] waitfor all]
+set t [mol new [file join $data models.cif] waitfor all]
+set a [atomselect $m all frame 1]
+set b [atomselect $t all frame 1]
+check "models.bcif loads by extension like models.cif" \
+    [expr {[molinfo $m get numframes] == 2 &&
+           [$a get {name resname resid chain x y z}] eq [$b get {name resname resid chain x y z}]}]
+$a delete; $b delete
+mol delete $m; mol delete $t
+set m [mol new "[file join $bcif chains.bcif]?chain=A" type mmcif waitfor all]
+check "BinaryCIF with ?chain=A and type mmcif" [expr {[molinfo $m get numatoms] == 5}]
+mol delete $m
+
+# 9. optional extra files: chemical components must come with bond orders
 foreach f $extra {
     set m [mol new $f type pdbx waitfor all]
     set s [atomselect $m all]

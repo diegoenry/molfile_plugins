@@ -1,0 +1,16 @@
+# file|message it must give
+bad_truncated.bcif|ends in the middle of a value
+bad_rowcount.bcif|does not match the row count
+bad_runlength.bcif|far more values than there are rows
+bad_offsets.bcif|string offset is out of range
+bad_index.bcif|string index is out of range
+bad_kind.bcif|unsupported encoding 'Zip'
+bad_bytes.bcif|not a whole number of values
+bad_packing.bcif|IntegerPacking data ends inside a value
+bad_delta.bcif|Delta values do not fit in 32 bits
+bad_noblocks.bcif|no list of data blocks
+bad_nesting.bcif|nested too deeply
+bad_ext.bcif|unsupported MessagePack type
+bad_bomb.bcif|implausibly large for the file size
+bad_strings.bcif|decoded text is implausibly large
+bad_rows.bcif|decoded text is implausibly large

@@ -16,8 +16,8 @@ tests/data/ihm_spheres.cif RESULT ok natoms=0 frames=0 bonds=0 orders=no graphic
 tests/data/ihm_starting.cif RESULT ok natoms=2 frames=1 bonds=0 orders=no graphics=0 flags=0x84 elementX=0 coordsum=15.200
 tests/data/label_vs_auth.cif RESULT ok natoms=6 frames=1 bonds=0 orders=no graphics=0 flags=0x81 elementX=0 coordsum=15.000
 tests/data/microhet_bond.cif RESULT ok natoms=3 frames=1 bonds=1 orders=no graphics=0 flags=0x1c0 elementX=0 coordsum=2.000
-tests/data/models_mismatch.cif RESULT ok natoms=3 frames=3 bonds=0 orders=no graphics=0 flags=0x80 elementX=0 coordsum=27.000
 tests/data/models.cif RESULT ok natoms=3 frames=2 bonds=0 orders=no graphics=0 flags=0x80 elementX=0 coordsum=12.000
+tests/data/models_mismatch.cif RESULT ok natoms=3 frames=3 bonds=0 orders=no graphics=0 flags=0x80 elementX=0 coordsum=27.000
 tests/data/multiblock.cif RESULT ok natoms=1 frames=1 bonds=0 orders=no graphics=0 flags=0x80 elementX=0 coordsum=3.000
 tests/data/no_type_symbol.cif RESULT ok natoms=2 frames=1 bonds=0 orders=no graphics=0 flags=0x0 elementX=2 coordsum=1.000
 tests/data/nonstandard_elements.cif RESULT ok natoms=4 frames=1 bonds=0 orders=no graphics=0 flags=0x86 elementX=3 coordsum=14.000

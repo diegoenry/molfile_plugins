@@ -66,7 +66,8 @@ ifndef VMD_DIR
 endif
 
 # VMD directory structure varies - try both common layouts
-ifeq ($(wildcard $(VMD_DIR)/lib/plugins/include),)
+# $(wildcard) splits paths with spaces (macOS app bundles), so test with the shell
+ifneq ($(shell test -d "$(VMD_DIR)/lib/plugins/include" && echo yes),yes)
     # Direct plugins directory (VMD 1.9.4+)
     VMD_PLUGIN_INCLUDE = $(VMD_DIR)/plugins/include
     VMD_PLUGIN_DIR = $(VMD_DIR)/plugins/$(VMD_ARCH)/molfile

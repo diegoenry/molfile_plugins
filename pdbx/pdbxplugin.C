@@ -2,8 +2,9 @@
  * pdbxplugin.C -- PDBx/mmCIF reader and writer plugin for VMD
  *
  * A rewrite of VMD's "pdbx" molfile plugin, and the single mmCIF plugin of
- * this repository: it also replaces the separate "mmcif" reader. It registers
- * as "pdbx" (extensions .cif, .mmcif) and, for scripts that name the old
+ * this repository: it also replaces the separate "mmcif" reader. It reads
+ * text mmCIF and BinaryCIF, plain or gzip-compressed. It registers as
+ * "pdbx" (extensions .cif, .mmcif, .bcif) and, for scripts that name the old
  * reader, as "mmcif", both with a higher version number than the plugins they
  * replace, so VMD picks this one when several are loaded. No code is shared
  * with either original implementation.
@@ -39,13 +40,16 @@
  *     plugins do).
  *   - Only some chains can be loaded: "file.cif?chain=A,B" or MMCIF_CHAIN
  *     (from the former mmcif plugin).
+ *   - BinaryCIF (.bcif, MessagePack) is read with all seven of its column
+ *     encodings and loads exactly like the text file it was made from.
  *
  * Robustness: memory stays proportional to the useful content of the file.
  * A single value is limited to 256 MiB and the number of models to one
  * million; models that do not match the first one keep no coordinates. Read
  * errors and damaged or truncated compressed data fail the load instead of
- * truncating it, other compressed formats and BinaryCIF are recognized and
- * named, and text from the file is filtered before it is printed.
+ * truncating it, other compressed formats are recognized and named, every
+ * size and offset in a BinaryCIF file is checked, and text from the file is
+ * filtered before it is printed.
  *
  * Reader field mapping (atom_site):
  *   name      <- label_atom_id        (fallback auth_atom_id, then type_symbol)
@@ -77,11 +81,16 @@
  * License: University of Illinois Open Source License
  */
 
+/* vmdplugin.h includes windows.h on Windows: keep its min/max macros out */
+#if defined(_WIN32) && !defined(NOMINMAX)
+#define NOMINMAX
+#endif
 #include "molfile_plugin.h"
 
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstdint>
 #include <cfloat>
 #include <climits>
 #include <cmath>
@@ -114,7 +123,7 @@ typedef off_t pdbx_off_t;
 #endif
 
 #define PDBX_MAJOR_VERSION 2
-#define PDBX_MINOR_VERSION 0
+#define PDBX_MINOR_VERSION 1
 
 namespace {
 
@@ -408,7 +417,7 @@ const size_t g_read_buffer_bytes = (size_t)1 << 16;
 #ifdef PDBX_TEST_HOOKS
 long long g_gz_rewind_factor = 4;
 long long g_gz_rewind_extra = (long long)64 << 20;
-#else
+#elif defined(_USE_ZLIB)
 const long long g_gz_rewind_factor = 4;
 const long long g_gz_rewind_extra = (long long)64 << 20;
 #endif
@@ -475,6 +484,34 @@ class CifReader {
   /* true if the file is gzip-compressed and being decompressed */
   bool compressed() const { return gz_; }
 
+  /* BinaryCIF: a MessagePack map with string keys ("version", "encoder",
+   * "dataBlocks"); text mmCIF never starts with these bytes. */
+  bool binarycif() const {
+    const unsigned char *b = (const unsigned char *)(buf_.empty() ? "" : &buf_[0]);
+    return end_ >= 2 && ((b[0] >= 0x80 && b[0] <= 0x8f) || b[0] == 0xde || b[0] == 0xdf) &&
+           ((b[1] >= 0xa0 && b[1] <= 0xbf) || b[1] == 0xd9);
+  }
+
+  /* All of the data, for a format that is read whole (BinaryCIF). Call
+   * right after open(). Fails beyond cap bytes. */
+  void read_all(std::vector<char> &out, size_t cap) {
+    out.assign(buf_.begin(), buf_.begin() + (std::ptrdiff_t)end_);
+    struct stat st;
+    if (!gz_ && fp_ && fstat(fileno(fp_), &st) == 0 && st.st_size > 0 &&
+        (unsigned long long)st.st_size <= cap)
+      out.reserve((size_t)st.st_size);         /* no regrowth for a plain file */
+    const size_t chunk = std::max(g_read_buffer_bytes, (size_t)1);
+    while (!eof_) {
+      const size_t old = out.size();
+      out.resize(old + chunk);
+      const size_t got = raw_read(&out[old], chunk);
+      out.resize(old + got);
+      if (got == 0) eof_ = true;
+      if (out.size() > cap)
+        throw std::runtime_error("BinaryCIF files larger than 1 GiB are not supported");
+    }
+  }
+
   /* Name of a compressed or binary format the data starts with (after
    * decompression), or NULL. Call right after open(). */
   const char *binary_format() const {
@@ -514,6 +551,8 @@ class CifReader {
     if (!seekable_) return false;
 #ifdef _USE_ZLIB
     if (gz_) return (long long)zrewound_ + times * (long long)s.offset <= gz_budget();
+#else
+    (void)times;
 #endif
     return true;
   }
@@ -1660,6 +1699,542 @@ class AtomSink : public Sink {
 };
 
 /* ========================================================================
+ * BinaryCIF input
+ *
+ * BinaryCIF (as served by RCSB, PDBe and Mol*) is the same data model as
+ * mmCIF, stored column by column in MessagePack and compressed with a chain
+ * of simple encodings. The file is read whole, parsed into a flat list of
+ * MessagePack values that point into the file buffer, and only the columns
+ * the sinks use are decoded. Each value is then written back as the text a
+ * CIF file holds, so everything after this (elements, chains, models, bonds,
+ * the chain selection) works exactly as for text. Every length, offset and
+ * count in the file is checked, and the decoded size is capped relative to
+ * the file size, so a small file cannot claim billions of values.
+ * ======================================================================== */
+
+const size_t kMaxBcifBytes = (size_t)1 << 30;   /* the whole file, decompressed */
+const size_t kMaxMpValues = (size_t)1 << 20;    /* MessagePack values in the file */
+const int kMaxMpDepth = 32;                     /* BinaryCIF nests about 8 deep */
+const long long kMaxBcifRows = (long long)1 << 28;
+
+void bcif_fail(const std::string &what) {
+  throw std::runtime_error("BinaryCIF: " + what);
+}
+
+/* One MessagePack value. Strings and binary data point into the file
+ * buffer; an array's elements (a map's keys and values, alternating) are
+ * `count` consecutive entries of the document from `first` on. */
+struct MpVal {
+  enum Type { NIL, BOOL, INT, FLOAT, STR, BIN, ARRAY, MAP };
+  unsigned char type;
+  bool b;
+  long long i;
+  double f;
+  const char *p;
+  size_t n;
+  size_t first, count;
+  MpVal() : type(NIL), b(false), i(0), f(0), p(NULL), n(0), first(0), count(0) {}
+};
+
+class MpDoc {
+ public:
+  std::vector<MpVal> v;                       /* v[0] is the top-level value */
+
+  void parse(const char *data, size_t size) {
+    p_ = (const unsigned char *)data;
+    n_ = size;
+    pos_ = 0;
+    v.assign(1, MpVal());
+    fill(0, 0);
+  }
+
+  const MpVal &root() const { return v[0]; }
+  const MpVal &elem(const MpVal &a, size_t k) const { return v[a.first + k]; }
+
+  /* the value of a map entry, or NULL */
+  const MpVal *get(const MpVal &m, const char *key) const {
+    if (m.type != MpVal::MAP) return NULL;
+    const size_t kl = strlen(key);
+    for (size_t k = 0; k < m.count; k++) {
+      const MpVal &key_val = v[m.first + 2 * k];
+      if (key_val.type == MpVal::STR && key_val.n == kl && memcmp(key_val.p, key, kl) == 0)
+        return &v[m.first + 2 * k + 1];
+    }
+    return NULL;
+  }
+
+ private:
+  const unsigned char *p_;
+  size_t n_, pos_;
+
+  void need(unsigned long long k) {
+    if (k > n_ - pos_) bcif_fail("the data ends in the middle of a value (truncated file?)");
+  }
+  unsigned long long be(int bytes) {          /* big-endian unsigned */
+    need((unsigned long long)bytes);
+    unsigned long long u = 0;
+    for (int k = 0; k < bytes; k++) u = (u << 8) | p_[pos_++];
+    return u;
+  }
+  static long long sign_extend(unsigned long long u, int bytes) {
+    if (bytes < 8 && (u >> (8 * bytes - 1)) & 1) u |= ~0ULL << (8 * bytes);
+    long long s;
+    memcpy(&s, &u, sizeof(s));
+    return s;
+  }
+
+  void fill(size_t idx, int depth) {
+    if (depth > kMaxMpDepth) bcif_fail("values are nested too deeply");
+    need(1);
+    const unsigned c = p_[pos_++];
+    MpVal &x = v[idx];
+    if (c <= 0x7f) { x.type = MpVal::INT; x.i = (long long)c; return; }
+    if (c >= 0xe0) { x.type = MpVal::INT; x.i = (long long)c - 256; return; }
+    if (c >= 0xa0 && c <= 0xbf) { bytes(idx, MpVal::STR, c & 0x1f); return; }
+    if (c >= 0x90 && c <= 0x9f) { container(idx, MpVal::ARRAY, c & 0x0f, depth); return; }
+    if (c >= 0x80 && c <= 0x8f) { container(idx, MpVal::MAP, c & 0x0f, depth); return; }
+    switch (c) {
+      case 0xc0: x.type = MpVal::NIL; return;
+      case 0xc2: case 0xc3: x.type = MpVal::BOOL; x.b = (c == 0xc3); return;
+      case 0xcc: x.type = MpVal::INT; x.i = (long long)be(1); return;
+      case 0xcd: x.type = MpVal::INT; x.i = (long long)be(2); return;
+      case 0xce: x.type = MpVal::INT; x.i = (long long)be(4); return;
+      case 0xcf: {
+        unsigned long long u = be(8);
+        if (u > (unsigned long long)LLONG_MAX) bcif_fail("an integer is too large");
+        v[idx].type = MpVal::INT; v[idx].i = (long long)u;
+        return;
+      }
+      case 0xd0: x.type = MpVal::INT; x.i = sign_extend(be(1), 1); return;
+      case 0xd1: x.type = MpVal::INT; x.i = sign_extend(be(2), 2); return;
+      case 0xd2: x.type = MpVal::INT; x.i = sign_extend(be(4), 4); return;
+      case 0xd3: x.type = MpVal::INT; x.i = sign_extend(be(8), 8); return;
+      case 0xca: {
+        uint32_t u = (uint32_t)be(4);
+        float f;
+        memcpy(&f, &u, sizeof(f));
+        v[idx].type = MpVal::FLOAT; v[idx].f = f;
+        return;
+      }
+      case 0xcb: {
+        unsigned long long u = be(8);
+        double d;
+        memcpy(&d, &u, sizeof(d));
+        v[idx].type = MpVal::FLOAT; v[idx].f = d;
+        return;
+      }
+      case 0xd9: bytes(idx, MpVal::STR, be(1)); return;
+      case 0xda: bytes(idx, MpVal::STR, be(2)); return;
+      case 0xdb: bytes(idx, MpVal::STR, be(4)); return;
+      case 0xc4: bytes(idx, MpVal::BIN, be(1)); return;
+      case 0xc5: bytes(idx, MpVal::BIN, be(2)); return;
+      case 0xc6: bytes(idx, MpVal::BIN, be(4)); return;
+      case 0xdc: container(idx, MpVal::ARRAY, be(2), depth); return;
+      case 0xdd: container(idx, MpVal::ARRAY, be(4), depth); return;
+      case 0xde: container(idx, MpVal::MAP, be(2), depth); return;
+      case 0xdf: container(idx, MpVal::MAP, be(4), depth); return;
+      default:
+        bcif_fail("unsupported MessagePack type (BinaryCIF uses no extension types)");
+    }
+  }
+
+  void bytes(size_t idx, unsigned char type, unsigned long long len) {
+    need(len);
+    v[idx].type = type;
+    v[idx].p = (const char *)p_ + pos_;
+    v[idx].n = (size_t)len;
+    pos_ += (size_t)len;
+  }
+
+  void container(size_t idx, unsigned char type, unsigned long long count, int depth) {
+    const unsigned long long slots = (type == MpVal::MAP) ? 2 * count : count;
+    need(slots);                              /* every value takes a byte or more */
+    if (v.size() + slots > kMaxMpValues)
+      bcif_fail("too many values (more than any BinaryCIF file has)");
+    const size_t first = v.size();
+    v.resize(first + (size_t)slots);         /* x would dangle: index from here */
+    v[idx].type = type;
+    v[idx].first = first;
+    v[idx].count = (size_t)count;
+    for (size_t k = 0; k < (size_t)slots; k++) fill(first + k, depth + 1);
+  }
+};
+
+/* A decoded array: integers (optionally fixed point), reals, or strings. */
+struct BcifArray {
+  enum Kind { INTS, REALS, STRINGS };
+  Kind kind;
+  std::vector<int32_t> ints;       /* INTS; STRINGS: index into the table, -1 = "" */
+  int decimals;                    /* INTS: value = ints / 10^decimals; -1: integers */
+  std::vector<double> reals;
+  bool single;                     /* REALS hold float32 values */
+  std::vector<const char *> sp;    /* STRINGS: the table, pointing into the file */
+  std::vector<size_t> sn;
+  BcifArray() : kind(INTS), decimals(-1), single(false) {}
+  size_t size() const { return kind == REALS ? reals.size() : ints.size(); }
+};
+
+class BcifDecoder {
+ public:
+  BcifDecoder(const MpDoc &d, size_t file_bytes)
+    : d_(d), spent_(0),
+      budget_((long long)64 * (long long)file_bytes + ((long long)16 << 20)),
+      emitted_(0),
+      emit_budget_((long long)64 * (long long)file_bytes + ((long long)64 << 20)) {}
+
+  /* Bytes of text given to the sinks, capped like the decoded values: an
+   * index column can repeat a long string in every row, and a category can
+   * claim many rows, so the text is not bounded by the file otherwise. */
+  void emit(unsigned long long bytes) {
+    if (bytes > (unsigned long long)emit_budget_ ||
+        (emitted_ += (long long)bytes) > emit_budget_)
+      bcif_fail("the decoded text is implausibly large for the file size");
+  }
+
+  /* Decode {data, encoding} into exactly `len` values. */
+  BcifArray column(const MpVal &enc_data, size_t len, const std::string &what) {
+    what_ = what;
+    if (enc_data.type != MpVal::MAP) fail("the column data is not a map");
+    const MpVal *data = d_.get(enc_data, "data");
+    const MpVal *enc = d_.get(enc_data, "encoding");
+    if (!data || (data->type != MpVal::BIN && data->type != MpVal::STR))
+      fail("no binary data");
+    if (!enc || enc->type != MpVal::ARRAY) fail("no list of encodings");
+    BcifArray a = chain(*data, *enc, len);
+    if (a.size() != len) fail("the number of values does not match the row count");
+    return a;
+  }
+
+ private:
+  const MpDoc &d_;
+  long long spent_;
+  const long long budget_;
+  long long emitted_;
+  const long long emit_budget_;
+  std::string what_;
+
+  void fail(const std::string &why) const { bcif_fail(what_ + ": " + why); }
+
+  /* Account for n new values; also caps one step at a few times the rows. */
+  void spend(unsigned long long n, size_t len) {
+    if (n > 8ULL * len + 1024) fail("an encoding step produces far more values than there are rows");
+    spent_ += (long long)n;
+    if (spent_ > budget_) fail("the decoded data is implausibly large for the file size");
+  }
+
+  long long num_int(const MpVal &e, const char *key) const {
+    const MpVal *x = d_.get(e, key);
+    if (x && x->type == MpVal::INT) return x->i;
+    if (x && x->type == MpVal::FLOAT && x->f == std::floor(x->f) && std::fabs(x->f) < 9.0e15)
+      return (long long)x->f;
+    fail(std::string("an encoding has no integer '") + key + "'");
+    return 0;
+  }
+  double num_real(const MpVal &e, const char *key) const {
+    const MpVal *x = d_.get(e, key);
+    if (x && x->type == MpVal::INT) return (double)x->i;
+    if (x && x->type == MpVal::FLOAT && std::isfinite(x->f)) return x->f;
+    fail(std::string("an encoding has no number '") + key + "'");
+    return 0;
+  }
+  static bool kind_is(const MpVal *k, const char *name) {
+    return k && k->type == MpVal::STR && k->n == strlen(name) && memcmp(k->p, name, k->n) == 0;
+  }
+  void need_ints(const BcifArray &a, const char *step) const {
+    if (a.kind != BcifArray::INTS || a.decimals >= 0)
+      fail(std::string(step) + " applied to values that are not integers");
+  }
+  static void push_checked(std::vector<int32_t> &out, long long x, const BcifDecoder *self) {
+    if (x < INT32_MIN || x > INT32_MAX) self->fail("an integer does not fit in 32 bits");
+    out.push_back((int32_t)x);
+  }
+
+  /* Undo the encodings, last first. The first step takes the raw bytes. */
+  BcifArray chain(const MpVal &raw, const MpVal &enc, size_t len) {
+    if (enc.count == 0) fail("empty list of encodings");
+    BcifArray a;
+    bool have_bytes = true;
+    for (size_t k = enc.count; k-- > 0;) {
+      const MpVal &e = d_.elem(enc, k);
+      if (e.type != MpVal::MAP) fail("an encoding is not a map");
+      const MpVal *kind = d_.get(e, "kind");
+      static const char *const known[] = { "ByteArray", "StringArray", "FixedPoint",
+        "IntervalQuantization", "RunLength", "Delta", "IntegerPacking", NULL };
+      bool is_known = false;
+      for (const char *const *kn = known; *kn && !is_known; kn++) is_known = kind_is(kind, *kn);
+      if (!is_known) {
+        if (kind && kind->type == MpVal::STR)
+          fail("unsupported encoding '" + printable(std::string(kind->p, kind->n)) + "'");
+        fail("an encoding has no kind");
+      }
+      if (kind_is(kind, "ByteArray")) {
+        if (!have_bytes) fail("ByteArray is not the first step");
+        byte_array(raw, num_int(e, "type"), len, a);
+        have_bytes = false;
+      } else if (kind_is(kind, "StringArray")) {
+        if (!have_bytes || k != 0) fail("StringArray is not the only step");
+        string_array(raw, e, len, a);
+        have_bytes = false;
+      } else {
+        if (have_bytes) fail("the first step is not ByteArray or StringArray");
+        if (kind_is(kind, "FixedPoint")) fixed_point(e, a);
+        else if (kind_is(kind, "IntervalQuantization")) interval(e, a);
+        else if (kind_is(kind, "RunLength")) run_length(e, len, a);
+        else if (kind_is(kind, "Delta")) delta(e, a);
+        else integer_packing(e, len, a);
+      }
+    }
+    if (have_bytes) fail("no decoding step");
+    return a;
+  }
+
+  void byte_array(const MpVal &raw, long long type, size_t len, BcifArray &a) {
+    size_t size = 0;
+    switch (type) {
+      case 1: case 4: size = 1; break;
+      case 2: case 5: size = 2; break;
+      case 3: case 6: case 32: size = 4; break;
+      case 33: size = 8; break;
+      default: fail("unknown ByteArray type");
+    }
+    if (raw.n % size != 0) fail("the byte count is not a whole number of values");
+    const size_t n = raw.n / size;
+    spend(n, len);
+    const unsigned char *b = (const unsigned char *)raw.p;
+    a = BcifArray();
+    if (type == 32 || type == 33) {
+      a.kind = BcifArray::REALS;
+      a.single = (type == 32);
+      a.reals.resize(n);
+      for (size_t i = 0; i < n; i++) {
+        unsigned long long u = 0;
+        for (size_t k = size; k-- > 0;) u = (u << 8) | b[i * size + k];   /* little-endian */
+        if (type == 32) {
+          uint32_t u32 = (uint32_t)u;
+          float f;
+          memcpy(&f, &u32, sizeof(f));
+          a.reals[i] = f;
+        } else {
+          double dv;
+          memcpy(&dv, &u, sizeof(dv));
+          a.reals[i] = dv;
+        }
+      }
+      return;
+    }
+    a.ints.reserve(n);
+    for (size_t i = 0; i < n; i++) {
+      unsigned long long u = 0;
+      for (size_t k = size; k-- > 0;) u = (u << 8) | b[i * size + k];
+      long long x;
+      if (type <= 3) {                          /* signed */
+        const unsigned long long sign = 1ULL << (8 * size - 1);
+        x = (u & sign) ? (long long)u - (long long)(sign << 1) : (long long)u;
+      } else {
+        x = (long long)u;
+      }
+      push_checked(a.ints, x, this);
+    }
+  }
+
+  void fixed_point(const MpVal &e, BcifArray &a) {
+    need_ints(a, "FixedPoint");
+    const double factor = num_real(e, "factor");
+    if (!(factor > 0)) fail("FixedPoint factor is not positive");
+    const bool single = d_.get(e, "srcType") && num_int(e, "srcType") == 32;
+    for (int k = 0; k <= 9; k++) {
+      if (factor == kPow10[k]) {                /* exact decimals: keep the integers */
+        a.decimals = k;
+        a.single = single;
+        return;
+      }
+    }
+    BcifArray r;
+    r.kind = BcifArray::REALS;
+    r.single = single;
+    r.reals.resize(a.ints.size());
+    for (size_t i = 0; i < a.ints.size(); i++) r.reals[i] = a.ints[i] / factor;
+    a.ints.clear();
+    a = r;
+  }
+
+  void interval(const MpVal &e, BcifArray &a) {
+    need_ints(a, "IntervalQuantization");
+    const double lo = num_real(e, "min"), hi = num_real(e, "max");
+    const long long steps = num_int(e, "numSteps");
+    if (steps < 2) fail("IntervalQuantization has fewer than 2 steps");
+    const double delta = (hi - lo) / (double)(steps - 1);
+    BcifArray r;
+    r.kind = BcifArray::REALS;
+    r.single = d_.get(e, "srcType") && num_int(e, "srcType") == 32;
+    r.reals.resize(a.ints.size());
+    for (size_t i = 0; i < a.ints.size(); i++) r.reals[i] = lo + delta * a.ints[i];
+    a = r;
+  }
+
+  void run_length(const MpVal &e, size_t len, BcifArray &a) {
+    need_ints(a, "RunLength");
+    const long long src = num_int(e, "srcSize");
+    if (src < 0) fail("RunLength srcSize is negative");
+    if (a.ints.size() % 2 != 0) fail("RunLength data is not (value, count) pairs");
+    spend((unsigned long long)src, len);
+    std::vector<int32_t> out;
+    out.reserve((size_t)src);
+    for (size_t i = 0; i < a.ints.size(); i += 2) {
+      const long long count = a.ints[i + 1];
+      if (count < 0 || (long long)out.size() + count > src)
+        fail("RunLength counts do not add up to srcSize");
+      out.insert(out.end(), (size_t)count, a.ints[i]);
+    }
+    if ((long long)out.size() != src) fail("RunLength counts do not add up to srcSize");
+    a.ints.swap(out);
+  }
+
+  void delta(const MpVal &e, BcifArray &a) {
+    need_ints(a, "Delta");
+    long long acc = num_int(e, "origin");
+    for (size_t i = 0; i < a.ints.size(); i++) {
+      acc += a.ints[i];
+      if (acc < INT32_MIN || acc > INT32_MAX) fail("Delta values do not fit in 32 bits");
+      a.ints[i] = (int32_t)acc;
+    }
+  }
+
+  void integer_packing(const MpVal &e, size_t len, BcifArray &a) {
+    need_ints(a, "IntegerPacking");
+    const long long bytes = num_int(e, "byteCount");
+    const MpVal *u = d_.get(e, "isUnsigned");
+    const bool is_unsigned = u && u->type == MpVal::BOOL && u->b;
+    const long long src = num_int(e, "srcSize");
+    if (bytes != 1 && bytes != 2) fail("IntegerPacking byteCount is not 1 or 2");
+    if (src < 0) fail("IntegerPacking srcSize is negative");
+    spend((unsigned long long)src, len);
+    const long long upper = is_unsigned ? (bytes == 1 ? 0xFF : 0xFFFF) : (bytes == 1 ? 0x7F : 0x7FFF);
+    const long long lower = -upper - 1;
+    std::vector<int32_t> out;
+    out.reserve((size_t)src);
+    const size_t n = a.ints.size();
+    for (size_t i = 0; i < n; i++) {
+      long long value = 0;
+      long long t = a.ints[i];
+      /* a limit value continues the number into the next one */
+      while (t == upper || (!is_unsigned && t == lower)) {
+        value += t;
+        if (++i >= n) fail("IntegerPacking data ends inside a value");
+        t = a.ints[i];
+      }
+      value += t;
+      if ((long long)out.size() >= src) fail("IntegerPacking gives more values than srcSize");
+      push_checked(out, value, this);
+    }
+    if ((long long)out.size() != src) fail("IntegerPacking gives fewer values than srcSize");
+    a.ints.swap(out);
+  }
+
+  /* String offsets count characters; convert them to byte offsets when the
+   * strings are not plain ASCII (UTF-8: count the bytes that start one). */
+  void string_array(const MpVal &raw, const MpVal &e, size_t len, BcifArray &a) {
+    const MpVal *sd = d_.get(e, "stringData");
+    const MpVal *offs = d_.get(e, "offsets");
+    const MpVal *oenc = d_.get(e, "offsetEncoding");
+    const MpVal *denc = d_.get(e, "dataEncoding");
+    if (!sd || sd->type != MpVal::STR) fail("StringArray has no stringData");
+    if (!offs || (offs->type != MpVal::BIN && offs->type != MpVal::STR))
+      fail("StringArray has no offsets");
+    if (!oenc || oenc->type != MpVal::ARRAY || !denc || denc->type != MpVal::ARRAY)
+      fail("StringArray has no offset or data encoding");
+
+    const std::string saved = what_;
+    what_ = saved + " (string offsets)";
+    BcifArray off = chain(*offs, *oenc, sd->n + 1);
+    what_ = saved + " (string indices)";
+    BcifArray idx = chain(raw, *denc, len);
+    what_ = saved;
+    need_ints(off, "StringArray offsets");
+    need_ints(idx, "StringArray indices");
+    if (off.ints.empty()) fail("StringArray has no offsets");
+
+    std::vector<size_t> byte_at;               /* character index -> byte offset */
+    bool ascii = true;
+    for (size_t i = 0; i < sd->n && ascii; i++)
+      if ((unsigned char)sd->p[i] >= 0x80) ascii = false;
+    if (!ascii) {
+      for (size_t i = 0; i < sd->n; i++)
+        if (((unsigned char)sd->p[i] & 0xC0) != 0x80) byte_at.push_back(i);
+      byte_at.push_back(sd->n);
+    }
+    const size_t nchars = ascii ? sd->n : byte_at.size() - 1;
+
+    a = BcifArray();
+    a.kind = BcifArray::STRINGS;
+    const size_t nstr = off.ints.size() - 1;
+    a.sp.resize(nstr);
+    a.sn.resize(nstr);
+    for (size_t k = 0; k < nstr; k++) {
+      const long long b0 = off.ints[k], b1 = off.ints[k + 1];
+      if (b0 < 0 || b1 < b0 || (size_t)b1 > nchars) fail("a string offset is out of range");
+      const size_t s0 = ascii ? (size_t)b0 : byte_at[(size_t)b0];
+      const size_t s1 = ascii ? (size_t)b1 : byte_at[(size_t)b1];
+      if (s1 - s0 > kMaxTokenBytes) fail("a string is larger than 256 MiB");
+      a.sp[k] = sd->p + s0;
+      a.sn[k] = s1 - s0;
+    }
+    for (size_t i = 0; i < idx.ints.size(); i++)
+      if (idx.ints[i] < -1 || idx.ints[i] >= (long long)nstr) fail("a string index is out of range");
+    a.ints.swap(idx.ints);
+  }
+};
+
+/* A wanted column of a BinaryCIF category. */
+struct BcifColumn {
+  std::string item;                /* lowercase */
+  BcifArray values;
+  std::vector<unsigned char> mask; /* empty, or 0 = value, 1 = '.', 2 = '?' */
+};
+
+/* Text of an integer: digits, or fixed point with `decimals` places. */
+size_t format_fixed(long long v, int decimals, char *buf) {
+  char tmp[32];
+  size_t n = 0;
+  const bool neg = v < 0;
+  unsigned long long u = neg ? 0ULL - (unsigned long long)v : (unsigned long long)v;
+  int digits = 0;
+  do {                              /* digits from the right; the loop runs past */
+    tmp[n++] = (char)('0' + (int)(u % 10));   /* the point once, so 5 with 3 */
+    u /= 10;                                  /* decimals gives "0.005" */
+    if (++digits == decimals) tmp[n++] = '.';
+  } while (u > 0 || digits <= decimals);
+  size_t o = 0;
+  if (neg) buf[o++] = '-';
+  while (n > 0) buf[o++] = tmp[--n];
+  return o;
+}
+
+/* Shortest text that reads back as the same number: a value that came from
+ * a short decimal ("17.047") is written that way again, so BinaryCIF reads
+ * exactly like the text file it was made from. */
+size_t format_real(double v, bool single, char *buf) {
+  for (int d = 0; d <= 6; d++) {
+    const double s = v * kPow10[d];
+    if (!(std::fabs(s) < 9.0e15)) break;
+    const double r = (double)std::llround(s);
+    const double back = r / kPow10[d];
+    if (single ? ((float)back == (float)v) : (back == v)) {
+      if (r == 0 && std::signbit(v)) {              /* keep the sign of -0.0 */
+        buf[0] = '-';
+        return 1 + format_fixed(0, d, buf + 1);
+      }
+      return format_fixed((long long)r, d, buf);
+    }
+  }
+  int n = snprintf(buf, 40, single ? "%.9g" : "%.17g", v);
+  if (n < 0 || n >= 40) return 0;
+  for (int i = 0; i < n; i++)
+    if (buf[i] == ',') buf[i] = '.';                 /* a comma-decimal locale */
+  return (size_t)n;
+}
+
+/* ========================================================================
  * Parser: drives the tokenizer, routes categories to sinks
  * ======================================================================== */
 
@@ -1680,6 +2255,25 @@ class Parser {
       end_block();
       if (has_content()) { extra_blocks = more; return; }
       if (!more) return;
+    }
+  }
+
+  /* The same for BinaryCIF: each category is a loop whose rows are given to
+   * the sink as text, column by column, as a CIF file would hold them. */
+  template <class Pred> void run_binary(const MpDoc &doc, size_t file_bytes,
+                                        Pred has_content) {
+    BcifDecoder dec(doc, file_bytes);
+    const MpVal *blocks = doc.get(doc.root(), "dataBlocks");
+    if (!blocks || blocks->type != MpVal::ARRAY) bcif_fail("no list of data blocks");
+    for (size_t b = 0; b < blocks->count; b++) {
+      begin_block();
+      const MpVal &blk = doc.elem(*blocks, b);
+      const MpVal *cats = doc.get(blk, "categories");
+      if (!cats || cats->type != MpVal::ARRAY) bcif_fail("a data block has no categories");
+      for (size_t c = 0; c < cats->count; c++)
+        binary_category(doc, dec, doc.elem(*cats, c));
+      end_block();
+      if (has_content()) { extra_blocks = (b + 1 < blocks->count); return; }
     }
   }
 
@@ -1724,6 +2318,81 @@ class Parser {
   Sink *sink_for(const std::string &cat) {
     std::map<std::string, Sink *>::iterator it = sinks_.find(cat);
     return (it == sinks_.end()) ? NULL : it->second;
+  }
+
+  /* one BinaryCIF category: decode the columns its sink uses, feed the rows */
+  void binary_category(const MpDoc &doc, BcifDecoder &dec, const MpVal &cat) {
+    const MpVal *name = doc.get(cat, "name");
+    if (!name || name->type != MpVal::STR) bcif_fail("a category has no name");
+    std::string cname = lowercase(name->p, name->n);
+    if (!cname.empty() && cname[0] == '_') cname.erase(0, 1);   /* "_atom_site" */
+    Sink *s = sink_for(cname);
+    if (!s) return;
+    const MpVal *rc = doc.get(cat, "rowCount");
+    const MpVal *cols = doc.get(cat, "columns");
+    if (!rc || rc->type != MpVal::INT || rc->i < 0 || rc->i > kMaxBcifRows)
+      bcif_fail("_" + printable(cname) + " has no valid row count");
+    if (!cols || cols->type != MpVal::ARRAY) bcif_fail("_" + printable(cname) + " has no columns");
+    const size_t nrows = (size_t)rc->i;
+
+    std::vector<BcifColumn> use;
+    for (size_t k = 0; k < cols->count; k++) {
+      const MpVal &col = doc.elem(*cols, k);
+      const MpVal *cn = doc.get(col, "name");
+      if (!cn || cn->type != MpVal::STR) bcif_fail("_" + printable(cname) + " has a column without a name");
+      const std::string item = lowercase(cn->p, cn->n);
+      if (!s->wants(item)) continue;
+      const std::string what = "_" + printable(cname) + "." + printable(item);
+      const MpVal *data = doc.get(col, "data");
+      if (!data) bcif_fail(what + ": no data");
+      use.push_back(BcifColumn());
+      use.back().item = item;
+      use.back().values = dec.column(*data, nrows, what);
+      const MpVal *mask = doc.get(col, "mask");
+      if (mask && mask->type != MpVal::NIL) {
+        BcifArray m = dec.column(*mask, nrows, what + " (mask)");
+        if (m.kind != BcifArray::INTS || m.decimals >= 0) bcif_fail(what + ": the mask is not integers");
+        std::vector<unsigned char> &mk = use.back().mask;
+        mk.resize(m.ints.size());
+        for (size_t r = 0; r < m.ints.size(); r++)
+          mk[r] = (unsigned char)(m.ints[r] == 0 ? 0 : m.ints[r] == 1 ? 1 : 2);
+      }
+    }
+
+    /* every row and value costs at least a byte, charged before any row is
+     * fed, so a huge row count fails at once (also with no columns used) */
+    dec.emit((unsigned long long)nrows * (use.size() + 1));
+    looped_.insert(cname);
+    std::vector<std::string> items(use.size());
+    for (size_t k = 0; k < use.size(); k++) items[k] = use[k].item;
+    s->begin(items);
+    char buf[48];
+    for (size_t r = 0; r < nrows; r++) {
+      for (size_t k = 0; k < use.size(); k++) {
+        const BcifColumn &col = use[k];
+        if (!col.mask.empty() && col.mask[r] != 0) {
+          s->value(k, col.mask[r] == 1 ? "." : "?", 1, true);
+          continue;
+        }
+        const BcifArray &a = col.values;
+        if (a.kind == BcifArray::STRINGS) {
+          const int32_t ix = a.ints[r];
+          if (ix < 0) { s->value(k, "", 0, false); continue; }   /* no string: "" */
+          dec.emit(a.sn[(size_t)ix]);
+          s->value(k, a.sp[(size_t)ix], a.sn[(size_t)ix], false);
+        } else if (a.kind == BcifArray::REALS) {
+          if (!std::isfinite(a.reals[r])) { s->value(k, "?", 1, true); continue; }
+          size_t n = format_real(a.reals[r], a.single, buf);
+          dec.emit(n);
+          s->value(k, buf, n, n == 0);
+        } else {
+          size_t n = format_fixed(a.ints[r], a.decimals > 0 ? a.decimals : 0, buf);
+          dec.emit(n);
+          s->value(k, buf, n, false);
+        }
+      }
+      s->end_row(use.size());
+    }
   }
 
   static void split_tag(const char *p, size_t n, std::string &cat, std::string &item) {
@@ -2555,7 +3224,8 @@ void *open_pdbx_read(const char *filepath_arg, const char *filetype, int *natoms
       printf("pdbxplugin) Unable to open file %s: %s\n", filepath, strerror(errno));
       return NULL;
     }
-    if (const char *fmt = reader.binary_format()) {
+    const bool binary = reader.binarycif();
+    if (const char *fmt = binary ? NULL : reader.binary_format()) {
       const char *hint = "";
       if (strstr(fmt, "compressed")) hint = " (decompress it first)";
 #ifndef _USE_ZLIB
@@ -2586,10 +3256,19 @@ void *open_pdbx_read(const char *filepath_arg, const char *filetype, int *natoms
     parser.add_sink("chem_comp_bond", &ctx.cc_bond);
     parser.add_sink("ihm_sphere_obj_site", &ctx.spheres);
 
-    parser.run([&ctx]() {
+    const auto has_content = [&ctx]() {
       return ctx.atom_site.nrows() > 0 || ctx.ihm_start.nrows() > 0 ||
              ctx.cc_atom.nrows() > 0 || ctx.spheres.nrows() > 0;
-    });
+    };
+    if (binary) {
+      std::vector<char> data;                    /* freed once the sinks hold the values */
+      reader.read_all(data, kMaxBcifBytes);
+      MpDoc doc;
+      doc.parse(data.empty() ? "" : &data[0], data.size());
+      parser.run_binary(doc, data.size(), has_content);
+    } else {
+      parser.run(has_content);
+    }
 
     if (reader.unterminated_quotes > 0 || reader.unterminated_text > 0)
       printf("pdbxplugin) Warning: %ld unterminated quoted value(s) and %ld unterminated "
@@ -2726,6 +3405,7 @@ void *open_pdbx_read(const char *filepath_arg, const char *filetype, int *natoms
     if (!h->graphics.empty())
       printf(", %lu IHM sphere(s) as graphics", (unsigned long)h->graphics.size());
     if (use_label) printf(" [label_asym_id/label_seq_id numbering]");
+    if (binary) printf(" [BinaryCIF]");
     if (reader.compressed()) printf(" [gzip]");
     printf("\n");
     if (filtered) {
@@ -3076,6 +3756,13 @@ void *open_pdbx_write(const char *path, const char *filetype, int natoms) {
     w = new PdbxWriter();
     const size_t plen = strlen(path);
     const bool gz = plen > 3 && iequals(path + plen - 3, 3, ".gz");
+    const size_t stem = gz ? plen - 3 : plen;
+    if (stem >= 5 && iequals(path + stem - 5, 5, ".bcif")) {
+      printf("pdbxplugin) Cannot write %s: this plugin writes text mmCIF only "
+             "(use a name ending in .cif or .cif.gz)\n", path);
+      delete w;
+      return NULL;
+    }
     std::string err;
     if (!w->out.open(path, gz, &err)) {
       printf("pdbxplugin) Unable to open %s for writing: %s\n", path, err.c_str());
@@ -3241,7 +3928,7 @@ VMDPLUGIN_API int VMDPLUGIN_init(void) {
   plugin.majorv = PDBX_MAJOR_VERSION;
   plugin.minorv = PDBX_MINOR_VERSION;
   plugin.is_reentrant = VMDPLUGIN_THREADSAFE;
-  plugin.filename_extension = "cif,mmcif";
+  plugin.filename_extension = "cif,mmcif,bcif";
   plugin.open_file_read = open_pdbx_read;
   plugin.read_structure = read_pdbx_structure;
   plugin.read_bonds = read_pdbx_bonds;

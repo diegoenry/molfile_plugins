@@ -60,7 +60,8 @@ ifndef VMD_DIR
 endif
 
 # VMD directory structure varies - try both common layouts
-ifeq ($(wildcard $(VMD_DIR)/lib/plugins/include),)
+# $(wildcard) splits paths with spaces (macOS app bundles), so test with the shell
+ifneq ($(shell test -d "$(VMD_DIR)/lib/plugins/include" && echo yes),yes)
     VMD_PLUGIN_INCLUDE = $(VMD_DIR)/plugins/include
     VMD_PLUGIN_DIR = $(VMD_DIR)/plugins/$(VMD_ARCH)/molfile
 else
@@ -149,7 +150,7 @@ config:
 	@echo "To override, use: make VMD_DIR=/path/to/vmd HDF5_PREFIX=/path/to/hdf5"
 
 $(PLUGIN): meshhdf5plugin.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $(PLUGIN) meshhdf5plugin.c
+	$(CC) $(CFLAGS) -o $(PLUGIN) meshhdf5plugin.c $(LDFLAGS)
 
 clean:
 	rm -f $(PLUGIN) *.o
