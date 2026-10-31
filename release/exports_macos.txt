@@ -1,0 +1,3 @@
+_vmdplugin_init
+_vmdplugin_register
+_vmdplugin_fini
