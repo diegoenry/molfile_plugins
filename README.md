@@ -33,6 +33,8 @@ The repository also has two tools that are not plugins:
 
 Each plugin builds one file, for example `pdbxplugin.so`. VMD uses that name on every platform, Windows included.
 
+Release archives for all platforms, with HDF5 built in, are made on a Mac by `release/make_release.sh`; see [release/README.md](release/README.md).
+
 ### macOS
 
 1. Install the compiler: `xcode-select --install`.

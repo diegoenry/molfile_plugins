@@ -1,0 +1,4 @@
+{
+  global: vmdplugin_init; vmdplugin_register; vmdplugin_fini;
+  local: *;
+};
