@@ -8,7 +8,7 @@ Once stable they will be part of VMD 2.x official distribution.
 | [`pdbx`](pdbx/README.md) | mmCIF/PDBx and BinaryCIF, plain or `.gz`; also writes mmCIF | `pdbx` (also `mmcif`) | `.cif` `.mmcif` `.bcif` | C++11; zlib (optional, for `.gz`) |
 | `sdf_reader_writer` | SDF/MOL V2000; also writes | `sdf` | `.sdf` `.mol` | C |
 | [`CNDB_hdf5_reader`](CNDB_hdf5_reader/README.md) | OpenMiChroM CNDB | `cndb` | `.cndb` | C, HDF5 |
-| [`gromacs_h5md`](gromacs_h5md/README.md) | GROMACS H5MD trajectories | `h5md_gromacs` | `.h5` `.h5md` | C, HDF5 |
+| [`gromacs_h5md`](gromacs_h5md/README.md) | GROMACS H5MD trajectories | `h5md_gromacs` | `.h5md` | C, HDF5 |
 | `MeshHDF5` | HDF5 meshes | `h5mesh` | `.h5mesh` | C, HDF5 |
 
 The repository also has two tools that are not plugins:
