@@ -1,2 +1,9 @@
 # Release archives made by release/make_release.sh
 dist/
+
+# Build outputs: compiled plugins and programs. Release archives have the
+# plugins built for every platform; see release/README.md.
+*.o
+*.so
+MeshOptimize/mesh_optimize
+.DS_Store
