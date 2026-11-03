@@ -8,7 +8,7 @@
  *
  * Author: Diego E. B. Gomes - Auburn University, Alabama, AL - USA 
  * E-mail: dgomes@auburn.edu 
- * Version: 0.1
+ * Version: 1.1
  *
  * File Format:
  *   H5MD (HDF5-based Molecular Data) with GROMACS topology extension
@@ -22,6 +22,7 @@
  *   - Optional velocities
  *   - Bond connectivity from /connectivity/bonds
  *   - Periodic boundary conditions (orthogonal and triclinic boxes)
+ *   - Residue numbers as GROMACS shows them, for example in a .gro file
  *
  * Limitations:
  *   - Thread-unsafe (HDF5 library limitation)
@@ -32,13 +33,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <hdf5.h>
 
 #include "molfile_plugin.h"
 
-/* Plugin version (experimental; matches the 0.1 module spec) */
-#define H5MD_GROMACS_VERSION_MAJOR 0
+/* Plugin version. VMD keeps the highest version of each plugin, so this must
+ * stay above the 1.0 of earlier builds. */
+#define H5MD_GROMACS_VERSION_MAJOR 1
 #define H5MD_GROMACS_VERSION_MINOR 1
 
 /* Unit conversion: nm to Angstroms */
@@ -73,7 +76,7 @@ typedef struct {
     float *masses;                   /* Atomic masses */
     float *charges;                  /* Partial charges */
     int32_t *species;                /* Atomic numbers (Z) */
-    int32_t *residue_ids;            /* Residue IDs within molecule */
+    int32_t *residue_ids;            /* Residue numbers, as stored (see residue_id_offset) */
 
     /* Decoded names (from lookup tables), one entry per particle */
     char **particle_names;           /* Atom names (per particle) */
@@ -104,6 +107,10 @@ typedef struct {
 
     /* Optional data flags */
     int has_velocities;
+
+    /* Subtracted from residue_id: 1 for files from GROMACS versions that
+     * stored each residue number plus one (see gromacs_adds_one_to_residue_ids) */
+    int residue_id_offset;
 
     /* Bond connectivity */
     int nbonds;
@@ -148,6 +155,70 @@ static int h5_read_int_attribute(hid_t obj_id, const char *attr_name, int *value
     H5Aclose(attr_id);
 
     return (status >= 0) ? H5MD_SUCCESS : H5MD_ERROR;
+}
+
+/* Read a one-element string attribute of object obj_name, fixed or variable
+ * length, into out (at most out_size - 1 characters). */
+static int h5_read_string_attribute(hid_t loc_id, const char *obj_name, const char *attr_name,
+                                    char *out, size_t out_size) {
+    hid_t attr_id, file_type, space_id, mem_type;
+    int ok = 0;
+
+    out[0] = '\0';
+    if (H5Aexists_by_name(loc_id, obj_name, attr_name, H5P_DEFAULT) <= 0) return H5MD_ERROR;
+    attr_id = H5Aopen_by_name(loc_id, obj_name, attr_name, H5P_DEFAULT, H5P_DEFAULT);
+    if (attr_id < 0) return H5MD_ERROR;
+
+    file_type = H5Aget_type(attr_id);
+    space_id = H5Aget_space(attr_id);
+    if (file_type >= 0 && space_id >= 0 && H5Tget_class(file_type) == H5T_STRING &&
+        H5Sget_simple_extent_npoints(space_id) == 1) {
+        mem_type = H5Tcopy(H5T_C_S1);
+        /* HDF5 won't convert between ASCII and UTF-8 strings (GROMACS writes UTF-8) */
+        H5Tset_cset(mem_type, H5Tget_cset(file_type));
+        if (H5Tis_variable_str(file_type) > 0) {
+            char *s = NULL;
+            H5Tset_size(mem_type, H5T_VARIABLE);
+            if (H5Aread(attr_id, mem_type, &s) >= 0 && s) {
+                safe_strcpy(out, s, out_size);
+                ok = 1;
+            }
+            if (s) H5free_memory(s);
+        } else {
+            /* HDF5 converts to a fixed size of out_size, truncating if needed */
+            H5Tset_size(mem_type, out_size);
+            H5Tset_strpad(mem_type, H5T_STR_NULLTERM);
+            if (H5Aread(attr_id, mem_type, out) >= 0) {
+                out[out_size - 1] = '\0';
+                ok = 1;
+            }
+        }
+        H5Tclose(mem_type);
+    }
+    if (space_id >= 0) H5Sclose(space_id);
+    if (file_type >= 0) H5Tclose(file_type);
+    H5Aclose(attr_id);
+
+    if (!ok) out[0] = '\0';
+    return ok ? H5MD_SUCCESS : H5MD_ERROR;
+}
+
+/* GROMACS 2026.0 to 2026.3, and the 2026 beta and release candidate, store
+ * each residue number plus one in residue_id. GROMACS 2026.4 fixed this
+ * ("Fix the wrong increment of residue id in H5MD", commit 8e5e7af9), without
+ * changing the gromacs_topology version, so the GROMACS version tells them apart. */
+static int gromacs_adds_one_to_residue_ids(const char *creator, const char *version) {
+    if (strcmp(creator, "GROMACS") != 0 || strncmp(version, "2026", 4) != 0) return 0;
+    if (version[4] == '.')   /* 2026.3, 2026.3-dev-... */
+        return isdigit((unsigned char)version[5]) && strtol(version + 5, NULL, 10) <= 3;
+    return version[4] == '\0' || version[4] == '-';   /* 2026, 2026-beta, 2026-rc */
+}
+
+/* Keep a residue number computed from file values within int */
+static int clamp_to_int(long long v) {
+    if (v > INT_MAX) return INT_MAX;
+    if (v < INT_MIN) return INT_MIN;
+    return (int)v;
 }
 
 /* Read string dataset (handles both variable-length and fixed-length strings) */
@@ -424,11 +495,10 @@ static int decode_molecule_type(hid_t group_id, molecule_type_t *moltype) {
     H5Dclose(dataset_id);
 
     /* Resolve the residue name for each particle directly from the per-particle
-     * residue_name index. NOTE: residue_id is intentionally NOT used as a table
-     * index. GROMACS writes residue_id = resind + 1 (values run 2..residue_count+1,
-     * not 1..residue_count), so indexing a per-type residue table by residue_id
-     * mislabels every single-residue molecule (water, ions) and the last residue
-     * of each chain as "UNK". The per-particle residue_name index is authoritative. */
+     * residue_name index. residue_id is a residue number, not an index: it can
+     * start anywhere, and GROMACS 2026.0 to 2026.3 store it plus one (see
+     * residue_id_offset). Indexing a residue table by it labelled water, ions
+     * and the last residue of each chain "UNK". */
     for (i = 0; i < moltype->particle_count; i++) {
         int idx = residue_name_indices[i];
         moltype->atom_residue_names[i] = (char *)malloc(MAX_RESIDUE_NAME);
@@ -520,6 +590,18 @@ static void *open_h5md_gromacs_read(const char *filepath, const char *filetype, 
         H5Fclose(h5md->file_id);
         free(h5md);
         return NULL;
+    }
+
+    /* Which GROMACS wrote the file decides how residue_id is read */
+    {
+        char creator[32], version[64];
+        if (h5_read_string_attribute(h5md->file_id, "/h5md/creator", "name",
+                                     creator, sizeof creator) == H5MD_SUCCESS &&
+            h5_read_string_attribute(h5md->file_id, "/h5md/creator", "version",
+                                     version, sizeof version) == H5MD_SUCCESS &&
+            gromacs_adds_one_to_residue_ids(creator, version)) {
+            h5md->residue_id_offset = 1;
+        }
     }
 
     /* Open topology group */
@@ -780,14 +862,34 @@ static int read_h5md_gromacs_structure(void *mydata, int *optflags, molfile_atom
     h5md_gromacs_t *h5md = (h5md_gromacs_t *)mydata;
     int vmd_atom_idx = 0;
     int moltype_idx, mol_copy, atom_idx;
+    int renumber_max;
+    long long max_resid = 0, next_resid;
 
     /* Set optional flags - we provide mass, charge, and atomic number */
     *optflags = MOLFILE_MASS | MOLFILE_CHARGE | MOLFILE_ATOMICNUMBER;
+
+    /* Residue numbers as GROMACS shows them, for example in a .gro file
+     * (gmx_mtop_t::finalize and AtomProxy::residueNumber in GROMACS): molecules
+     * with more than one residue keep their topology numbers, and single-residue
+     * molecules (water, ions) are numbered on from the highest of those, in
+     * order. A system of a single molecule is not renumbered. */
+    renumber_max = (h5md->num_molecule_types == 1 && h5md->molecule_counts[0] == 1) ? 0 : 1;
+    for (moltype_idx = 0; moltype_idx < h5md->num_molecule_types; moltype_idx++) {
+        const molecule_type_t *moltype = &h5md->molecule_types[moltype_idx];
+        if (moltype->residue_count <= renumber_max) continue;
+        for (atom_idx = 0; atom_idx < moltype->particle_count; atom_idx++) {
+            long long r = (long long)moltype->residue_ids[atom_idx] - h5md->residue_id_offset;
+            if (r > max_resid) max_resid = r;
+        }
+    }
+    next_resid = max_resid + 1;
 
     /* Reconstruct full system from molecule types */
     for (moltype_idx = 0; moltype_idx < h5md->num_molecule_types; moltype_idx++) {
         molecule_type_t *moltype = &h5md->molecule_types[moltype_idx];
         int num_copies = h5md->molecule_counts[moltype_idx];
+        int renumber = moltype->residue_count <= renumber_max;
+        int nres = moltype->residue_count > 0 ? moltype->residue_count : 0;
 
         for (mol_copy = 0; mol_copy < num_copies; mol_copy++) {
             for (atom_idx = 0; atom_idx < moltype->particle_count; atom_idx++) {
@@ -798,13 +900,15 @@ static int read_h5md_gromacs_structure(void *mydata, int *optflags, molfile_atom
                 safe_strcpy(atom->type, moltype->particle_names[atom_idx], sizeof(atom->type));
 
                 /* Residue name is resolved per particle from the lookup table
-                 * (see decode_molecule_type); residue_id must not be used as a
-                 * table index because GROMACS offsets it by one. */
+                 * (see decode_molecule_type) */
                 safe_strcpy(atom->resname, moltype->atom_residue_names[atom_idx], sizeof(atom->resname));
 
-                /* residue_id is already a unique per-residue key; offset by the
-                 * molecule copy so distinct copies stay distinct in VMD. */
-                atom->resid = moltype->residue_ids[atom_idx] + (mol_copy * 10000);
+                if (renumber) {
+                    atom->resid = clamp_to_int(next_resid + (long long)mol_copy * nres);
+                } else {
+                    atom->resid = clamp_to_int((long long)moltype->residue_ids[atom_idx]
+                                               - h5md->residue_id_offset);
+                }
 
                 safe_strcpy(atom->segid, moltype->name, sizeof(atom->segid));
                 atom->chain[0] = '\0';
@@ -818,6 +922,7 @@ static int read_h5md_gromacs_structure(void *mydata, int *optflags, molfile_atom
                 vmd_atom_idx++;
             }
         }
+        if (renumber) next_resid += (long long)num_copies * nres;
     }
 
     h5md->natoms = vmd_atom_idx;
