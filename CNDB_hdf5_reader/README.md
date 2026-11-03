@@ -224,7 +224,7 @@ See `BENCHMARKING.md` for detailed optimization strategies.
 ## File Structure
 
 - `cndbplugin.c` - Main plugin source code
-- `cndbplugin.so` - Compiled plugin
+- `cndbplugin.so` - the plugin, made by `make` (not in the repository; release archives have it built for every platform)
 - `Makefile` - Build configuration
 - `chromatin_tube.tcl` - Smooth tube visualization (B-spline based with benchmarking)
 - `test_cndb_plugin.tcl` - Basic test script

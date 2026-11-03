@@ -50,19 +50,22 @@ else
     $(error Unsupported platform: $(UNAME_S))
 endif
 
-# VMD directories - platform-specific default (only applied if VMD_DIR is unset).
-# NOTE: $(wildcard) does not match paths containing spaces (macOS .app bundles),
-# so use "$(shell test -d ...)" for existence checks.
-ifeq ($(PLATFORM),macOS)
-    VMD_DIR ?= /Applications/VMD.app/Contents/vmd
-    ifeq ($(shell test -d "$(VMD_DIR)" && echo yes),)
-        VMD_DIR = /Applications/VMD 1.9.4a57.app/Contents/vmd
+# VMD installation (only looked for if VMD_DIR is unset). App bundle paths
+# contain spaces, so detection uses the shell rather than $(wildcard), and the
+# paths given to the compiler are quoted.
+ifndef VMD_DIR
+    ifeq ($(PLATFORM),macOS)
+        VMD_DIR := $(shell for d in /Applications/VMD*.app/Contents/vmd* \
+                     $(HOME)/Applications/VMD*.app/Contents/vmd* \
+                     $(HOME)/software/VMD*.app/Contents/vmd*; do \
+                     if [ -d "$$d" ]; then echo "$$d"; break; fi; done)
+    else
+        VMD_DIR := $(shell for d in /usr/local/lib/vmd $(HOME)/vmd; do \
+                     if [ -d "$$d" ]; then echo "$$d"; break; fi; done)
     endif
-    ifeq ($(shell test -d "$(VMD_DIR)" && echo yes),)
-        $(warning VMD not found at default location. Set VMD_DIR manually.)
-    endif
-else
-    VMD_DIR ?= /usr/local/lib/vmd
+endif
+ifeq ($(shell test -d "$(VMD_DIR)" && echo yes),)
+    $(warning VMD not found. Set VMD_DIR, or VMD_PLUGIN_INCLUDE to the folder with molfile_plugin.h.)
 endif
 
 # Plugin headers live under plugins/include or lib/plugins/include depending on
@@ -80,13 +83,13 @@ HDF5_LIBS := $(shell pkg-config --libs hdf5 2>/dev/null)
 ifeq ($(HDF5_CFLAGS),)
     HDF5_INCLUDE ?= $(HDF5_PREFIX)/include
     HDF5_LIB ?= $(HDF5_PREFIX)/lib
-    HDF5_CFLAGS = -I$(HDF5_INCLUDE)
-    HDF5_LIBS = -L$(HDF5_LIB) -lhdf5 -lz
+    HDF5_CFLAGS = -I"$(HDF5_INCLUDE)"
+    HDF5_LIBS = -L"$(HDF5_LIB)" -lhdf5 -lz
 endif
 
 # Compiler flags
 CFLAGS = -O2 -fPIC -Wall -Wextra
-CFLAGS += -I$(VMD_PLUGIN_INCLUDE)
+CFLAGS += -I"$(VMD_PLUGIN_INCLUDE)"
 CFLAGS += $(HDF5_CFLAGS)
 
 # Linker flags
@@ -97,7 +100,7 @@ LDFLAGS += -lm
 # Add rpath for runtime library discovery on Linux
 ifeq ($(UNAME_S),Linux)
     ifneq ($(HDF5_LIB),)
-        LDFLAGS += -Wl,-rpath,$(HDF5_LIB)
+        LDFLAGS += -Wl,-rpath,"$(HDF5_LIB)"
     endif
 endif
 

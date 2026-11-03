@@ -53,7 +53,7 @@ Plugins (in molfile/)
                                                      also gzip-compressed; also writes mmCIF
   sdfplugin.so            sdf               1.1      SDF/MOL V2000: .sdf .mol; also writes them
   cndbplugin.so           cndb              0.2      OpenMiChroM CNDB: .cndb
-  h5mdplugin_gromacs.so   h5md_gromacs      0.1      GROMACS H5MD: .h5md
+  h5mdplugin_gromacs.so   h5md_gromacs      1.1      GROMACS H5MD: .h5md
   meshhdf5plugin.so       h5mesh            1.0      HDF5 triangle meshes: .h5mesh
 
 Requirements

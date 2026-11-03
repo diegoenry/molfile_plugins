@@ -14,13 +14,16 @@ gromacs_topology module extension.
  
 Author: Diego E. B. Gomes - Auburn University, Alabama, AL - USA 
 E-mail: dgomes@auburn.edu 
-Version: 0.1
+Version: 1.1
 
 # WARNING: 
 This is a temporary location, plugin will be moved to VMD 2.0 plugin source tree when validated.
 
 # WARNING 2:
 The modules gromacs.mdwn and gromacs_topology.mdwn are not official GROMACS files, and certainly incomplete specifications. They're my interpretation of the GROMCAS 2026.0 source code and the h5md I had on my hands. 
+
+# Residue numbers
+VMD shows the residue numbers GROMACS uses, as in a `.gro` file: molecules with more than one residue (proteins) keep their topology numbers, and water, ions and other single-residue molecules are numbered on from the highest of those. GROMACS 2026.0 to 2026.3 store each residue number plus one in the file; the plugin corrects that, using the GROMACS version recorded in the file. GROMACS 2026.4 and later store them as they are.
 
 # Plugin build instructions tested for MacOSX Sequoia 15.7.3
 
